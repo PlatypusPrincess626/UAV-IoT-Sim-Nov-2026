@@ -550,6 +550,9 @@ def load_track(track, a):
                 X, Y = ch_tokens(d, a, rng, per_ep)
             else:
                 X, Y = d["patches"].astype(np.float64), d["sun"].astype(np.float64)
+                if per_ep and len(X) > per_ep:                 # cap per episode, like the CH tokens
+                    keep = np.sort(rng.choice(len(X), per_ep, replace=False))
+                    X, Y = X[keep], Y[keep]
             Xs.append(X)
             Ys.append(Y)
             Gs.append(np.full(len(X), episode_id(f)))
@@ -560,6 +563,7 @@ def load_track(track, a):
     else:
         mu, sd = Xtr.mean((0, 2, 3), keepdims=True), Xtr.std((0, 2, 3), keepdims=True)
     sd = np.where(sd < 1e-6, 1.0, sd)
+    setattr(a, f"_{track}_stats", (mu, sd))         # reused by Mem_test.py for whole-episode sequences
     # Rare, nearly constant features (e.g. minutes since a charge shortfall) give huge z-scores on held-out
     # episodes; clip so a handful of tokens cannot dominate any method's latent or probe.
     clip = (lambda Z: np.clip(Z, -a.z_clip, a.z_clip)) if track == "ch" else (lambda Z: Z)
@@ -843,7 +847,10 @@ def neural(track, kind, k, seed, a):
             dev = torch.device(a.device)
             self.dev = dev
             X = torch.tensor(_flat(X), dtype=torch.float32).to(dev)
-            Xv = torch.tensor(_flat(Xv), dtype=torch.float32).to(dev)
+            Xv = _flat(Xv)
+            if len(Xv) > 4096:                              # early-stopping subset (scoring uses all of val/test)
+                Xv = Xv[np.sort(np.random.default_rng(0).choice(len(Xv), 4096, replace=False))]
+            Xv = torch.tensor(Xv, dtype=torch.float32).to(dev)
             d, var = X.shape[1], kind == "vae"
             if track == "map":
                 self.enc, self.dec = ConvEnc(var).to(dev), ConvDec().to(dev)
