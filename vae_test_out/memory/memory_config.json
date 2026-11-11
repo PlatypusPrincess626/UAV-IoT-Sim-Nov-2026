@@ -1,0 +1,26 @@
+{
+ "history": 8,
+ "history_stride": 15,
+ "token_every": 5,
+ "z_clip": 8.0,
+ "max_train": 200000,
+ "max_epochs": 100,
+ "patience": 8,
+ "beta": 1.0,
+ "kl_tol": 0.5,
+ "k_token": 8,
+ "k_map": 32,
+ "hidden": 256,
+ "mixtures": 5,
+ "mem_epochs": 60,
+ "mem_patience": 8,
+ "mem_batch": 32,
+ "mem_lr": 0.001,
+ "dock_m": 50.0,
+ "rollout": [
+  6,
+  12
+ ],
+ "map_max_train": null,
+ "map_max_epochs": null
+}
