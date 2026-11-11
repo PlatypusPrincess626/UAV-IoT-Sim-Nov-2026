@@ -1,0 +1,62 @@
+{
+ "area_km2": 36.0,
+ "sensors": 200,
+ "uavs": 6,
+ "ch_select": "silhouette",
+ "min_ch": 4,
+ "max_ch": 10,
+ "depart_charge": 80.0,
+ "uav_reserve": 20.0,
+ "flight_margin": 1.25,
+ "num_ch": null,
+ "policy_cycle": [
+  "greedy",
+  "random",
+  "rotation"
+ ],
+ "ch_start_soc": [
+  15.0,
+  70.0
+ ],
+ "sensor_start_soc": [
+  10.0,
+  60.0
+ ],
+ "uav_start_soc": [
+  50.0,
+  100.0
+ ],
+ "layout": "farm",
+ "field_m": [
+  400.0,
+  800.0
+ ],
+ "woodlot_frac": [
+  0.1,
+  0.3
+ ],
+ "hedgerow_m": 15.0,
+ "sensors_per_field": [
+  3,
+  8
+ ],
+ "base_station": true,
+ "bs_exclusion_m": 1500.0,
+ "sweep": "cached",
+ "tour_fresh_min": 30.0,
+ "charger_divert": true,
+ "terrain": "fixed",
+ "terrain_feature_m": 12.5,
+ "tree_cover": [
+  0.15,
+  0.5
+ ],
+ "stand_size_m": [
+  30.0,
+  90.0
+ ],
+ "random_patches": 300,
+ "seed_base": 1000,
+ "val_frac": 0.15,
+ "test_frac": 0.25
+}
