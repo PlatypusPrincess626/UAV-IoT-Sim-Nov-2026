@@ -427,7 +427,13 @@ def cmd_run(a, b):
                 continue
             row = run_config(kind, seed, a, b, ch, mp, S, cache, mode)
             print("memory", {k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()}, flush=True)
-            pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+            new = pd.DataFrame([row])
+            if os.path.exists(path):
+                prev = pd.read_csv(path)
+                if list(prev.columns) != list(new.columns):           # columns changed: rewrite aligned
+                    pd.concat([prev, new], ignore_index=True).to_csv(path, index=False)
+                    continue
+            new.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
         cache = {k: v for k, v in cache.items() if k[0] not in ("vae", "vae-ratio")}       # VAE seeds are not reused
     meta = dict(linear=linear, onset={sp: S[sp]["onset"] for sp in S},
                 sequences={sp: int(len(S[sp]["X"])) for sp in S}, steps=int(S["train"]["X"].shape[1]))
