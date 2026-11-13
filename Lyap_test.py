@@ -57,6 +57,7 @@ Run:
 import argparse
 import math
 import os
+import shutil
 import time
 
 import numpy as np
@@ -87,6 +88,9 @@ def parse(argv=None):
                     help="map transform (default: best linear method in summary_map.csv)")
     ap.add_argument("--arms", nargs="+", default=["lstm", "lstm_diss", "ren", "attn", "lren"],
                     choices=["lstm", "lstm_diss", "ren", "attn", "lren"])
+    ap.add_argument("--force", action="store_true",
+                    help="delete the saved results of every arm family named in --arms (all rates and gammas, all "
+                         "seeds; a .bak copy of each file is kept) and rerun them; other arms are kept")
     ap.add_argument("--gammas", type=float, nargs="+", default=[3.0, 10.0, 30.0],
                     help="lren: certified input -> prediction gain (per-step l2 in, per-step l2 out)")
     ap.add_argument("--lren-rate", type=float, default=0.97, help="lren: certified contraction rate")
@@ -842,9 +846,43 @@ def arm_list(a):
     return arms
 
 
+def force_clear(a):
+    """--force: drop the rows of every arm family in --arms from the results files and the configs they own."""
+    path = os.path.join(a.lyap_out, "lyap_runs.csv")
+    fam = lambda s: s.astype(str).str.split("@").str[0].isin(a.arms)
+    left = None
+    for f in ("lyap_runs.csv", "lyap_impulse.csv"):
+        p = os.path.join(a.lyap_out, f)
+        if not os.path.exists(p):
+            continue
+        d = pd.read_csv(p)
+        drop = fam(d.arm)
+        if drop.any():
+            shutil.copy(p, p + ".bak")
+            d[~drop].to_csv(p, index=False)
+            print(f"--force: removed {int(drop.sum())} rows of {sorted(set(d.arm[drop]))} from {f} "
+                  f"(backup {f}.bak)", flush=True)
+        if f == "lyap_runs.csv":
+            left = d[~drop]
+    cfgs = ["lyap_config_lren.json"] if "lren" in a.arms else []
+    if left is None or not len(left):
+        cfgs.append("lyap_config.json")                 # no results left that depend on the shared config
+    for c in cfgs:
+        p = os.path.join(a.lyap_out, c)
+        if os.path.exists(p):
+            os.remove(p)
+            print(f"--force: removed {c}", flush=True)
+    for f in ("lyap_summary.csv", "lyap_paired.csv"):   # stale until the report step rebuilds them
+        p = os.path.join(a.lyap_out, f)
+        if os.path.exists(p):
+            os.remove(p)
+
+
 def cmd_run(a, b):
     V.resolve_device(b)
     os.makedirs(a.lyap_out, exist_ok=True)
+    if a.force:
+        force_clear(a)
     V.check_config(os.path.join(a.lyap_out, "lyap_config.json"), argparse.Namespace(**{**vars(b), **vars(a)}),
                    ("k_token", "k_map", "linear_map", "hidden", "ren_state", "ren_neurons", "attn_window", "attn_dim",
                     "attn_heads", "attn_layers", "attn_c", "penalty", "mixtures", "mem_epochs", "mem_patience",
