@@ -508,9 +508,10 @@ class LRENMemory(Memory):
             ev = torch.linalg.eigvalsh(0.5 * (W + W.T))
             # numerical check of the scaled LMI: lambda_min(Psi) / |Psi| should be >= 0 (up to rounding)
             m = b["Psi0"].shape[0]
-            Psi = torch.zeros(m + s.din, m + s.din, dtype=torch.float64)
+            dv = b["Psi0"].device
+            Psi = torch.zeros(m + s.din, m + s.din, dtype=torch.float64, device=dv)
             Psi[:m, :m], Psi[:m, m:], Psi[m:, :m] = b["Psi0"], alpha * b["N"], alpha * b["N"].T
-            Psi[m:, m:] = alpha ** 2 * mu * torch.eye(s.din, dtype=torch.float64)
+            Psi[m:, m:] = alpha ** 2 * mu * torch.eye(s.din, dtype=torch.float64, device=dv)
             G = torch.cat([b["Gz"], alpha * b["D22"]], 1)
             Psi -= G.T @ G / nu
             pe = torch.linalg.eigvalsh(Psi)
