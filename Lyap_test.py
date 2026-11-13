@@ -15,6 +15,13 @@ code is 1-Lipschitz by construction. Memory arms, all trained the same way (teac
   ren@r           a contracting Recurrent Equilibrium Network (Revay, Wang & Manchester) with a prescribed rate r,
                   by construction: free parameters are mapped to matrices that satisfy the contraction LMI, so plain
                   Adam training keeps the guarantee. Explicit form (D11 = 0), tanh neurons.
+  lren@rgG        a Lipschitz-bounded REN (rate r = --lren-rate, gain G from --gammas) certified end to end: its output
+                  IS the predicted mean, and one incremental dissipation inequality (an LMI satisfied for every
+                  parameter value) gives contraction at rate r, input -> prediction gain <= G, initial state ->
+                  prediction (cert_Lx) and input -> memory state (cert_Lh). Mixture weights and scales may depend on
+                  the state: the component means are re-centred so the mixture mean is exactly the certified output.
+                  Defaults planned from the ren results: rate 0.97, 256 states / 256 neurons, up to 120 epochs.
+                  Its settings live in lyap_config_lren.json, so it can be added to an existing results folder.
   attn            a 2-layer L2 self-attention transformer (tied query/key, Kim, Papamakarios & Mnih 2021) over a
                   sliding window of --attn-window steps; every matrix's spectral norm is capped at --attn-c.
                   No recurrent state: memory is the window itself.
@@ -36,6 +43,11 @@ Measured (held-out validation sequences):
                 measure |d pred_{t+k}| / delta for k = 0..--impulse-len. imp_half = steps for it to halve.
   emp_rho       state contraction: two copies of the memory start from different states and get identical
                 inputs; emp_rho is the per-step shrink factor of their distance, state_half the steps to halve.
+lren only (bound_ok also requires both):
+  cert_Lx/emp_Lx  initial state -> prediction: |dy_t| <= cert_Lx r^(t+1) |dx_0|; emp_Lx from random state pairs.
+  cert_Lh/emp_Lh  input -> memory state (what a controller would read), same per-step l2 convention as cert_L.
+  alpha           input scale the construction applied (1 = the gain bound did not bind).
+  lmi_min         smallest eigenvalue of the certifying LMI / its largest (>= 0 up to rounding).
 Plus every Mem_test metric (next_fvu, added_fvu, latent_r2, dreams, hidden-charge R^2, outage AUCs).
 
 Run:
@@ -60,7 +72,8 @@ V = M.V
 
 KEY = ["val_next_fvu", "val_added_fvu", "val_latent_r2", "val_roll12_fvu", "val_mem_soc_r2", "val_mem_onset_auc",
        "val_mem_out60_auc", "val_mem_gain_soc_r2", "test_mem_soc_r2", "test_mem_onset_auc", "cert_rho", "cert_L",
-       "head_lip", "emp_lip", "tightness", "emp_rho", "state_half", "imp_k0", "imp_k12", "imp_k48", "imp_half", "epochs"]
+       "head_lip", "emp_lip", "tightness", "emp_rho", "state_half", "imp_k0", "imp_k12", "imp_k48", "imp_half", "epochs",
+       "alpha", "cert_Lx", "emp_Lx", "cert_Lh", "emp_Lh", "lmi_min"]
 
 
 def parse(argv=None):
@@ -72,8 +85,17 @@ def parse(argv=None):
     ap.add_argument("--k-map", type=int, default=32)
     ap.add_argument("--linear-map", default=None, choices=V.MAP_METHODS,
                     help="map transform (default: best linear method in summary_map.csv)")
-    ap.add_argument("--arms", nargs="+", default=["lstm", "lstm_diss", "ren", "attn"],
-                    choices=["lstm", "lstm_diss", "ren", "attn"])
+    ap.add_argument("--arms", nargs="+", default=["lstm", "lstm_diss", "ren", "attn", "lren"],
+                    choices=["lstm", "lstm_diss", "ren", "attn", "lren"])
+    ap.add_argument("--gammas", type=float, nargs="+", default=[3.0, 10.0, 30.0],
+                    help="lren: certified input -> prediction gain (per-step l2 in, per-step l2 out)")
+    ap.add_argument("--lren-rate", type=float, default=0.97, help="lren: certified contraction rate")
+    ap.add_argument("--lren-state", type=int, default=256)
+    ap.add_argument("--lren-neurons", type=int, default=256)
+    ap.add_argument("--lren-head", default="mix", choices=["mix", "const"],
+                    help="mix: mixture weights depend on the state (mean still certified); const: learned constants")
+    ap.add_argument("--lren-epochs", type=int, default=120)
+    ap.add_argument("--lren-patience", type=int, default=12)
     ap.add_argument("--rates", type=float, nargs="+", default=[0.9, 0.97, 0.99],
                     help="certified contraction rates for lstm_diss and ren (per 5-minute step)")
     ap.add_argument("--seeds", type=int, default=9)
@@ -333,6 +355,176 @@ class RENMemory(Memory):
 
 
 # ----------------------------------------------------------------------------------------------
+# Lipschitz-bounded REN: contraction rate r and input -> predicted-mean gain <= gamma, head included
+# ----------------------------------------------------------------------------------------------
+class LRENMemory(Memory):
+    """Explicit REN whose OUTPUT is the predicted mean, so the certificate runs from the inputs (and the initial
+    state) all the way to the prediction, with no separate head bound multiplied on.
+
+        E x+ = F x + B1 w + B2 u + bx,   w = tanh(C1 x + D12 u + bv),   y = C2 x + D21 w + D22 u + by
+
+    Incremental dissipation (Delta between any two runs; V = |E dx|^2 in the metric P^-1):
+        V(dx+) + |dy|^2 / nu  <=  r^2 V(dx) + mu |du|^2                                           (*)
+    holds when, with blocks ordered (x, w, x+, u),
+        Psi = [[Psi0, N], [N', mu I]] - G' G / nu  >= 0,   G = [C2, D21, 0, D22],   N = [0; -Lambda D12; B2]
+    and Psi0 the contraction matrix of RENMemory (built from H = X'X + eps I, positive definite for every
+    parameter value). For fixed nu the smallest feasible mu is a closed-form eigenvalue (Schur complement).
+    Iterating (*) from equal initial states with every |du_t| <= delta gives the per-step (sup-sup) bound
+        |dy_t| <= sqrt(nu mu / (1 - r^2)) delta = L* delta
+    (1/sqrt(1-r^2), not the 1/(1-r) of a triangle-inequality bound). Scaling the input channel by alpha scales the
+    gain by alpha exactly (a congruence of Psi), so the model feeds alpha u with alpha = min(1, gamma / L*): every
+    parameter value gives a model with gain <= gamma, and plain Adam keeps the certificate.
+    Also certified: initial state -> output |dy_t| <= cert_Lx r^(t+1) |dx0|, cert_Lx = sqrt(nu lambda_max(E'P^-1 E)),
+    and input -> memory state |dx_t| <= alpha sqrt(mu / (1 - r^2)) / sqrt(lambda_min(E'P^-1 E)) (cert_Lh).
+    Mixture head: component means are y + o_k - sum_j pi_j o_j, so the mixture mean is exactly y whatever the
+    offsets o, weights pi and scales do; those may all depend on the state (as in the Mem_test head)."""
+
+    def __init__(s, din, dz, a, rate, gamma):
+        super().__init__()
+        n, q = a.lren_state, a.lren_neurons
+        s.n, s.q, s.din, s.dz, s.K = n, q, din, dz, a.mixtures
+        s.rate, s.gamma = rate, gamma
+        m = 2 * n + q
+        s.X = nn.Parameter(torch.randn(m, m) / math.sqrt(m))
+        s.Y = nn.Parameter(torch.zeros(n, n))
+        s.B2 = nn.Parameter(0.1 * torch.randn(n, din) / math.sqrt(din))      # small: start with alpha near 1
+        s.D12 = nn.Parameter(0.1 * torch.randn(q, din) / math.sqrt(din))
+        s.C2, s.D21 = nn.Parameter(torch.zeros(dz, n)), nn.Parameter(torch.zeros(dz, q))
+        D22 = torch.zeros(dz, din)
+        D22[:, :dz] = torch.eye(dz)                     # start at persistence: predict z_{t+1} = z_t
+        s.D22 = nn.Parameter(D22)
+        s.bx, s.bv, s.by = nn.Parameter(torch.zeros(n)), nn.Parameter(torch.zeros(q)), nn.Parameter(torch.zeros(dz))
+        s.state_head = a.lren_head == "mix"
+        s.aux = nn.Linear(n, (3 if s.state_head else 2) * dz * a.mixtures)
+        if not s.state_head:
+            s.pi = nn.Parameter(torch.zeros(dz, a.mixtures))
+        s.register_buffer("tau", torch.tensor(1.0))    # nu = nu_min (1 + 1e-4) + tau, tau re-chosen every 50 steps
+        s._cache, s._steps = None, 0
+
+    def train(s, mode=True):
+        s._cache = None
+        return super().train(mode)
+
+    # -- the LMI pieces -------------------------------------------------------------------------------
+    def blocks(s, dtype=None):
+        n, q = s.n, s.q
+        X, Y = (s.X, s.Y) if dtype is None else (s.X.to(dtype), s.Y.to(dtype))
+        cv = (lambda T: T) if dtype is None else (lambda T: T.to(dtype))
+        Hm = X.T @ X + 1e-3 * torch.eye(X.shape[0], device=X.device, dtype=X.dtype)
+        H11, H21, H22 = Hm[:n, :n], Hm[n:n + q, :n], Hm[n:n + q, n:n + q]
+        F, B1, P = Hm[n + q:, :n], Hm[n + q:, n:n + q], Hm[n + q:, n + q:]
+        lam = 0.5 * H22.abs().sum(1)
+        C1 = -H21 / lam[:, None]
+        E = 0.5 * (H11 / s.rate ** 2 + P + Y - Y.T)
+        Psi0 = Hm.clone()
+        Psi0[n:n + q, n:n + q] = torch.diag(2 * lam)
+        Gz = torch.cat([cv(s.C2), cv(s.D21), torch.zeros(s.dz, n, device=X.device, dtype=X.dtype)], 1)
+        N = torch.cat([torch.zeros(n, s.din, device=X.device, dtype=X.dtype), -lam[:, None] * cv(s.D12), cv(s.B2)], 0)
+        return dict(E=E, F=F, B1=B1, C1=C1, P=P, lam=lam, Psi0=Psi0, Gz=Gz, N=N, D22=cv(s.D22))
+
+    @staticmethod
+    def nu_min(b):
+        Lc = torch.linalg.cholesky(b["Psi0"])
+        Z = torch.linalg.solve_triangular(Lc, b["Gz"].T, upper=False)
+        return torch.linalg.eigvalsh(Z.T @ Z)[-1]
+
+    @staticmethod
+    def mu_star(b, nu):
+        S = b["Psi0"] - b["Gz"].T @ b["Gz"] / nu
+        Lc = torch.linalg.cholesky(S)
+        Mx = b["N"] - b["Gz"].T @ b["D22"] / nu
+        Z = torch.linalg.solve_triangular(Lc, Mx, upper=False)
+        return torch.linalg.eigvalsh(b["D22"].T @ b["D22"] / nu + Z.T @ Z)[-1]
+
+    def gain(s, b, nu):
+        return torch.sqrt(nu * s.mu_star(b, nu) / (1 - s.rate ** 2))
+
+    def mats(s):
+        if s._cache is not None:
+            return s._cache
+        b = s.blocks()
+        nu = s.nu_min(b).detach() * (1 + 1e-4) + s.tau
+        alpha = torch.clamp(s.gamma / s.gain(b, nu), max=1.0)
+        Ei = torch.linalg.inv(b["E"])
+        out = dict(A=Ei @ b["F"], B1=Ei @ b["B1"], B2=Ei @ s.B2, bx=Ei @ s.bx, C1=b["C1"], alpha=alpha)
+        if not s.training:
+            s._cache = {k: v.detach() for k, v in out.items()}
+        return out
+
+    @torch.no_grad()
+    def project(s):
+        """Not a projection (the certificate holds for every parameter value): every 50 steps re-pick nu, the free
+        multiplier of the output term, so that alpha restricts the model as little as possible."""
+        s._steps += 1
+        if s._steps % 50 != 1:
+            return
+        b = s.blocks(torch.float64)
+        nm = float(s.nu_min(b)) * (1 + 1e-4)
+        ts = np.logspace(-6, 4, 41)
+        g = [float(s.gain(b, nm + t)) for t in ts]
+        s.tau.fill_(float(ts[int(np.argmin(g))]))
+        s._cache = None
+
+    # -- forward --------------------------------------------------------------------------------------
+    def forward(s, x, state=None):
+        k = s.mats()
+        u = x * k["alpha"]
+        Bn, T, _ = x.shape
+        xs = state if state is not None else x.new_zeros(Bn, s.n)
+        Du, Bu, Yu = u @ s.D12.T + s.bv, u @ k["B2"].T + k["bx"], u @ s.D22.T + s.by
+        hs, ys = [], []
+        for t in range(T):
+            w = torch.tanh(xs @ k["C1"].T + Du[:, t])
+            ys.append(xs @ s.C2.T + w @ s.D21.T + Yu[:, t])
+            xs = xs @ k["A"].T + w @ k["B1"].T + Bu[:, t]
+            hs.append(xs)
+        h, y = torch.stack(hs, 1), torch.stack(ys, 1)
+        sh = h.shape[:-1]
+        p = s.aux(h).view(*sh, s.dz, -1, s.K)
+        logpi = torch.log_softmax(p[..., 2, :], -1) if s.state_head else \
+            torch.log_softmax(s.pi, -1).expand(*sh, s.dz, s.K)
+        o = p[..., 0, :]
+        mu = y.unsqueeze(-1) + o - (logpi.exp() * o).sum(-1, keepdim=True)    # mixture mean == y exactly
+        return h, xs, logpi, mu, p[..., 1, :].clamp(-7.0, 5.0)
+
+    # -- certificate (float64, nu optimised) ------------------------------------------------------------
+    def certificate(s):
+        with torch.no_grad():
+            alpha = float(s.mats()["alpha"])
+            b = s.blocks(torch.float64)
+            nm = float(s.nu_min(b)) * (1 + 1e-6)
+            ts = np.logspace(-9, 6, 151)
+            gs = [float(s.gain(b, nm + t)) for t in ts]
+            i = int(np.argmin(gs))
+            for _ in range(40):                                  # refine around the grid minimum
+                lo, hi = ts[max(i - 1, 0)], ts[min(i + 1, len(ts) - 1)]
+                ts = np.linspace(lo, hi, 7)
+                gs = [float(s.gain(b, nm + t)) for t in ts]
+                i = int(np.argmin(gs))
+            nu = nm + ts[i]
+            mu = float(s.mu_star(b, nu)) * (1 + 1e-6)
+            Lstar = math.sqrt(nu * mu / (1 - s.rate ** 2))
+            W = b["E"].T @ torch.linalg.solve(b["P"], b["E"])     # V = dx' E' P^-1 E dx
+            ev = torch.linalg.eigvalsh(0.5 * (W + W.T))
+            # numerical check of the scaled LMI: lambda_min(Psi) / |Psi| should be >= 0 (up to rounding)
+            m = b["Psi0"].shape[0]
+            Psi = torch.zeros(m + s.din, m + s.din, dtype=torch.float64)
+            Psi[:m, :m], Psi[:m, m:], Psi[m:, :m] = b["Psi0"], alpha * b["N"], alpha * b["N"].T
+            Psi[m:, m:] = alpha ** 2 * mu * torch.eye(s.din, dtype=torch.float64)
+            G = torch.cat([b["Gz"], alpha * b["D22"]], 1)
+            Psi -= G.T @ G / nu
+            pe = torch.linalg.eigvalsh(Psi)
+            s.extra = dict(cert_Lx=math.sqrt(nu) * math.sqrt(float(ev[-1])),
+                           cert_Lh=alpha * math.sqrt(mu / (1 - s.rate ** 2)) / math.sqrt(float(ev[0])),
+                           lmi_min=float(pe[0] / pe.abs().max()), alpha=alpha, gamma=s.gamma)
+            return s.rate, alpha * Lstar, float("nan")
+
+    def random_state(s, B, dev):
+        g = torch.Generator().manual_seed(1)
+        return torch.randn(B, s.n, generator=g).to(dev)
+
+
+# ----------------------------------------------------------------------------------------------
 # L2 self-attention transformer over a sliding window
 # ----------------------------------------------------------------------------------------------
 def capped(W, c):
@@ -409,13 +601,16 @@ class AttnMemory(Memory):
 
 def build(arm, din, dz, a, R):
     name, rate = (arm.split("@") + [None])[:2]
-    rate = float(rate) if rate else None
+    rate = float(rate) if rate and name != "lren" else None
     if name == "lstm":
         return LSTMMemory(din, dz, a, R)
     if name == "lstm_diss":
         return LSTMMemory(din, dz, a, R, rate)
     if name == "ren":
         return RENMemory(din, dz, a, rate)
+    if name == "lren":                                       # lren@<rate>g<gamma>
+        r, g = arm.split("@")[1].split("g")
+        return LRENMemory(din, dz, a, float(r), float(g))
     return AttnMemory(din, dz, a)
 
 
@@ -431,11 +626,12 @@ def train(arm, seed, D, a, b):
     m = build(arm, din, dz, a, R).to(dev)
     m.project()
     opt = torch.optim.Adam(m.parameters(), lr=a.mem_lr)
+    epochs, patience = (a.lren_epochs, a.lren_patience) if arm.startswith("lren") else (a.mem_epochs, a.mem_patience)
     Xi, Zt = torch.tensor(tr["inp"][:, :-1]), torch.tensor(tr["zs"][:, 1:].astype(np.float32))
     Vi, Vz = torch.tensor(va["inp"][:, :-1]).to(dev), torch.tensor(va["zs"][:, 1:].astype(np.float32)).to(dev)
     g = torch.Generator().manual_seed(seed)
     best, best_state, bad = float("inf"), None, 0
-    for ep in range(a.mem_epochs):
+    for ep in range(epochs):
         m.train()
         for idx in torch.randperm(len(Xi), generator=g).split(a.mem_batch):
             _, _, lp, mu, ls = m(Xi[idx].to(dev))
@@ -457,7 +653,7 @@ def train(arm, seed, D, a, b):
             best_state = {k: v.detach().clone() for k, v in m.state_dict().items()}
         else:
             bad += 1
-            if bad >= a.mem_patience:
+            if bad >= patience:
                 break
     m.load_state_dict(best_state)
     m.eval()
@@ -529,6 +725,33 @@ def contraction(m, X, L=48):
     return rho, float(below[0]) if len(below) else float("nan")
 
 
+def state_tests(m, X, eps, steps, L=48):
+    """lren only. emp_Lx: two runs from different initial states, same inputs:
+    max_t |dy_t| / (r^(t+1) |dx0|), must be <= cert_Lx. emp_Lh: worst input perturbation (per-step l2 ball, gradient
+    ascent) of the memory state: max_t |dx_t| / delta, must be <= cert_Lh."""
+    with torch.no_grad():
+        X = X[:, :L]
+        x0 = m.random_state(X.shape[0], X.device)
+        _, _, lp0, mu0, _ = m(X)
+        _, _, lp1, mu1, _ = m(X, x0)
+        dy = (m.mean(lp1, mu1) - m.mean(lp0, mu0)).norm(dim=-1)                     # (B, L)
+        decay = m.rate ** torch.arange(1, X.shape[1] + 1, device=X.device, dtype=dy.dtype)
+        emp_x = float((dy / decay / x0.norm(dim=-1, keepdim=True)).max())
+    g = torch.Generator().manual_seed(0)
+    base = m(X)[0].detach()
+    d = ball(torch.randn(X.shape, generator=g).to(X.device), eps)
+    best = 0.0
+    for k in range(steps + 1):
+        d = d.detach().requires_grad_(True)
+        r = (m(X + d)[0] - base).norm(dim=-1).amax(1)
+        best = max(best, float(r.detach().max()) / eps)
+        if k == steps:
+            break
+        gr, = torch.autograd.grad(r.sum(), d)
+        d = ball(d + 0.25 * eps * gr / (gr.norm(dim=-1, keepdim=True) + 1e-12), eps)
+    return emp_x, best
+
+
 # ----------------------------------------------------------------------------------------------
 # Run
 # ----------------------------------------------------------------------------------------------
@@ -586,6 +809,12 @@ def run_arm(arm, seed, a, b, D, zstats, tok, S):
     for k in (0, 12, 48):
         row[f"imp_k{k}"] = float(curve[k]) if k < len(curve) else float("nan")
     row["emp_rho"], row["state_half"] = contraction(m, X)
+    for k in ("cert_Lx", "cert_Lh", "lmi_min", "alpha", "gamma", "emp_Lx", "emp_Lh"):
+        row[k] = getattr(m, "extra", {}).get(k, float("nan"))
+    if isinstance(m, LRENMemory):
+        row["emp_Lx"], row["emp_Lh"] = state_tests(m, X, a.eps, a.pgd_steps)
+        row["bound_ok"] = bool(row["bound_ok"] and row["emp_Lx"] <= row["cert_Lx"] * (1 + 1e-6)
+                               and row["emp_Lh"] <= row["cert_Lh"] * (1 + 1e-6))
     row["seconds"] = round(time.time() - t0, 1)
     return row, curve
 
@@ -605,6 +834,8 @@ def arm_list(a):
     for k in a.arms:
         if k in ("lstm_diss", "ren"):
             arms += [f"{k}@{r:g}" for r in a.rates]
+        elif k == "lren":
+            arms += [f"lren@{a.lren_rate:g}g{g:g}" for g in a.gammas]
         else:
             arms.append(k)
     return arms
@@ -620,6 +851,9 @@ def cmd_run(a, b):
                     "map_max_train", "token_every", "history", "history_stride", "z_clip"), "Lyapunov results")
     lin = a.linear_map or M.default_linear(a)[0]
     arms = arm_list(a)
+    if any(x.startswith("lren") for x in arms):     # own file, so lren can be added to an existing results folder
+        V.check_config(os.path.join(a.lyap_out, "lyap_config_lren.json"), a,
+                       ("lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience"), "lren results")
     print(f"vision: token PCA ({a.k_token}) + map {lin} ({a.k_map}), frozen and 8-bit; memory arms: {arms}", flush=True)
     ch = V.load_track("ch", b)
     mt = b.max_train
