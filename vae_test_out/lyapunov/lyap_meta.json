@@ -1,0 +1,1 @@
+{"linear_map":"db2","arms":["lstm","lstm_diss@0.9","lstm_diss@0.97","lstm_diss@0.99","ren@0.9","ren@0.97","ren@0.99","attn"],"onset":{"train":16736,"val":4659,"test":7247},"sequences":{"train":5107,"val":1363,"test":2091},"steps":144}
