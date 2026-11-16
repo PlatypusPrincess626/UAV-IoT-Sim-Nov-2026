@@ -594,6 +594,16 @@ class ClusterHead(EdgeDevice):
         self.total_amp_spent += fraction * need_mAh * 60.0   # as an average current over the minute
         return 60.0 * fraction
 
+    def credit_sensor(self, sensor, step):
+        """A UAV collected this member sensor on a sortie (CFG.sortie_credit == "visit"): its age restarts now."""
+        if getattr(self, "_sens_idx_of", None) is not self.sens_table:          # rebuilt if the table changes
+            self._sens_idx = {id(self.sens_table.iat[j, 0]): j for j in range(len(self.sens_table))}
+            self._sens_idx_of = self.sens_table
+        idx = self._sens_idx
+        j = idx.get(id(sensor))
+        if j is not None:
+            self.age_table[j] = step
+
     def _sensor_order(self):
         """
         Cached visiting order of this CH's sensors: nearest-neighbour from the CH, then 2-opt on the

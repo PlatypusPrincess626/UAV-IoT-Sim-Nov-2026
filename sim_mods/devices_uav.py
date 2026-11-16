@@ -265,6 +265,8 @@ class QuadUAV:
                     self._comms.get("max_dist_ambc"):
 
                 totalData += dataReturn
+                if CFG.sortie_credit == "visit" and self.targetHead is not None:
+                    self.targetHead.credit_sensor(device, step)      # this sensor's data is now fresh
 
                 if self.tour_iter < len(self.tour):
                     self.target = self.tour[self.tour_iter]
@@ -460,6 +462,10 @@ class QuadUAV:
                 train_p = self._charge_static()
             elif CFG.charging == "dynamic":
                 train_p = self._charge_dynamic(dist, peak)
+            elif CFG.charging == "external":
+                # Ctrl_test.py: the targeting model sets is_charging / p_count itself when it picks the next
+                # charger (charge here first, then leave); only the shared exit rules below apply
+                train_p = False
             else:
                 train_p = self._charge_model(action_p)
 

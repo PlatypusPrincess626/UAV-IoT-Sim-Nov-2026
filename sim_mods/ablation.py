@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 # ---- Choices for each ablation axis -------------------------------------
 TARGET_AGENTS = ("ddaqn", "ddqn", "ppo", "ql", "gann", "random")
-CHARGING_POLICIES = ("model", "dynamic", "static")
+CHARGING_POLICIES = ("model", "dynamic", "static", "external")
 SENSOR_SWEEPS = ("christofides", "legacy", "none", "cached")
 DECISION_STATES = ("projected", "raw")
 ENERGY_REWARDS = ("paper", "overflow", "level")
@@ -32,6 +32,10 @@ class AblationConfig:
     # Charger diversion (off = paper behaviour): a UAV whose docked CH has supplied no charge for
     # divert_after minutes, or whose next leg would breach the reserve while its CH cannot supply,
     # flies to the best reachable charger: rating = perceived usable charge (base station = 1).
+    # Sortie credit: "gated" (as before) refreshes a CH's swept sensors only when the returning UAV's lifetime
+    # data from that CH exceeds the CH's total uploads to every UAV, which with several UAVs almost never
+    # happens, so swept sensors keep their age; "visit" refreshes each sensor's age when a UAV collects from it.
+    sortie_credit: str = "gated"
     charger_divert: bool = False
     divert_after: int = 2
     divert_min_soc: float = 30.0

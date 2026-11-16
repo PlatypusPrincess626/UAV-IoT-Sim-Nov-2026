@@ -241,6 +241,7 @@ def build_world(ep_seed, a):
     # behaviour policy below for targeting
     CFG.charging, CFG.sensor_sweep, CFG.decision_state = "dynamic", a.sweep, "raw"
     CFG.charger_divert, CFG.tour_fresh_min = a.charger_divert, a.tour_fresh_min
+    CFG.sortie_credit = getattr(a, "sortie_credit", None) or "gated"
     # K-means picks K in [max(--min-ch, number of UAVs), --max-ch]: at least one CH per UAV
     ch_range = None if a.num_ch is not None or a.ch_select != "silhouette" else (max(a.min_ch, a.uavs), a.max_ch)
     auto = a.num_ch is None and a.ch_select == "coverage"
@@ -440,7 +441,7 @@ def collect_one(job):
 WORLD_KEYS = ("area_km2", "sensors", "uavs", "num_ch", "ch_select", "min_ch", "max_ch", "depart_charge",
               "uav_reserve", "flight_margin", "val_frac", "test_frac", "terrain", "policy_cycle", "ch_start_soc",
               "sensor_start_soc", "uav_start_soc", "layout", "field_m", "woodlot_frac", "hedgerow_m",
-              "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "bs_exclusion_m",
+              "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "sortie_credit", "bs_exclusion_m",
               "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base")
 RUN_KEYS = ("n_episodes", "val_frac", "test_frac", "history", "history_stride", "token_every", "z_clip", "max_train", "max_eval",
             "max_probe", "max_epochs", "patience", "batch", "lr", "beta", "kl_tol")
@@ -1259,6 +1260,10 @@ def parse(argv=None):
                    help="sensor tours: cached nearest-neighbour + 2-opt order, skipping fresh sensors and "
                         "truncated to what the battery allows (default), or the paper's Christofides split")
     w.add_argument("--tour-fresh-min", type=float, default=30.0, help="skip sensors refreshed this recently")
+    w.add_argument("--sortie-credit", choices=("gated", "visit"), default=None,
+                   help="sensor ages after a sortie: unset = gated (the original rule: refreshed only when the "
+                        "returning UAV's lifetime data from the CH exceeds the CH's total uploads, which with several "
+                        "UAVs almost never happens); visit = refreshed when a UAV collects from the sensor")
     w.add_argument("--charger-divert", action=argparse.BooleanOptionalAction, default=True,
                    help="UAVs divert to the best reachable charger when their CH cannot supply")
     w.add_argument("--terrain", choices=("fixed", "stretched"), default="fixed")
