@@ -1,0 +1,17 @@
+{
+ "train_episodes": 600,
+ "episodes_per_iter": 12,
+ "gamma": 0.99,
+ "lam": 0.95,
+ "credit": "difference",
+ "clip": 0.2,
+ "ppo_epochs": 4,
+ "minibatch": 256,
+ "lr": 0.0003,
+ "ent": 0.01,
+ "vcoef": 0.5,
+ "ctrl_hidden": 64,
+ "k_token": 8,
+ "k_map": 32,
+ "linear_map": null
+}
