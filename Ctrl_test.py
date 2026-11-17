@@ -42,16 +42,28 @@ Decision (one per visit, when the UAV is at a charger and has no sensor sortie l
   destination and the current charger. h_c comes from M after it has consumed the UGV's tokens and docking up
   to the previous 5-minute step (World Models: h_t summarises z_<t, a_<t); z_c is the latest token.
 
+Memory state (--h-dim 16): the controller gets the first 16 principal components of M's standardised state
+  (fitted on the training sequences), so every memory arm hands it the same small input; 0 = the full state.
+
+Warm start (--warm-start greedy): before PPO the controller imitates a teacher acting through the same
+  features: greedy on the fleet's view of each charger's peak AoI minus flight time (skipping chargers another
+  UAV is heading to), charging the shortest option that leaves --teacher-soc % after the leg. Values are fitted
+  to the teacher's returns. Imitation accuracy is in ctrl_bc.csv. PPO then improves on it.
+
 Safety shield (on): the simulator's reserve check and charger diversion stay active underneath the controller
   (a UAV whose next leg would breach the reserve tops up first; a UAV whose UGV cannot supply diverts to the best
   reachable charger). The controller's choice is what PPO is trained on; the shield is part of the environment.
-  Sensor sorties (cached nearest-neighbour + 2-opt tour) are unchanged.
+  Sensor sorties (cached nearest-neighbour + 2-opt tour) are unchanged. --supply-margin 5: a UGV counts as able
+  to supply only above 15 %, for every policy run here (at 0 a UGV held at 10 % by its solar trickle trapped
+  UAVs in a charge-again loop).
 
 Rewards (the paper's equations, fleet view): every minute
       R_peak = max(1 - max_c peak AoI_c / 120, 0)   R_avg = max(1 - mean_c avg AoI_c / t, 0)   (Eqs. 18, 19)
   with each charger's AoI the fleet's freshest (minimum over UAVs), and per UAV R_chg from the simulator
   (Eq. 20). Destination head: 0.7 R_peak + 0.3 R_avg (Eq. 23); charge head: 0.25 R_peak + 0.25 R_avg + 0.5 R_chg
-  (Eq. 22). A dead UAV earns 0 from then on (Eq. 21). Each head has its own value and advantage (semi-MDP
+  (Eq. 22). A dead UAV earns 0 from then on (Eq. 21). Training only: the charge head loses --ugv-penalty (1.0)
+  for every minute its UAV sits on a UGV at or below the 10 % reserve (ugv_drain_min); reported rewards
+  exclude it. Each head has its own value and advantage (semi-MDP
   returns between a UAV's decisions, discount --gamma per minute).
   Credit (--credit difference, default): six UAVs share one fleet reward, so one UAV's choice barely moves it
   (its correlation with the chosen charger's staleness was ~0.03). Each UAV is instead given the paper's AoI
@@ -65,13 +77,14 @@ Baselines (always evaluated): greedy (highest AoI minus flight time), random seq
 Outputs (in --ctrl-out, default <out>/controller)
   models/vision.pkl, models/mem_<arm>_s<seed>.pt      frozen V and M
   ctrl/<arm>__<charging>__s<seed>.pt                    trained controller (ckpt_*.pt while training)
+  ctrl_bc.csv         warm start: imitation accuracy and the teacher's own scores
   ctrl_train.csv      learning curve: one row per PPO iteration
   ctrl_eval.csv       one row per (arm, charging, seed, world); the eval step resumes from it
   ctrl_summary.csv    per arm: mean and 95 % CI over seeds (baselines: over worlds)
   ctrl_paired.csv     paired gaps per seed vs the greedy baseline and vs the lstm arm with the same charging
 
 Run
-  python Ctrl_test.py all --out vae_test_out --workers 16              # fit, train, eval, report
+  python Ctrl_test.py all --out vae_test_out --k-token 16 --workers 16    # fit, train, eval, report
   python Ctrl_test.py all --out vae_test_out --seeds 3 --memories none lstm lren@0.97g100   # a first pass
   python Ctrl_test.py train --memories lren@0.97g100 --charging binary --force   # retrain those controllers
 """
@@ -98,9 +111,10 @@ BASELINES = ("greedy", "random", "rotation")
 DEFAULT_MEMORIES = ["none", "lstm", "lstm_diss@0.97", "ren@0.97", "attn", "lren@0.97g30", "lren@0.97g100"]
 TRAIN_WORLD_BASE, EVAL_WORLD_BASE = 200_000, 900_000       # VAE_test data uses seed_base (1000) + episode
 AOI_SAT = 120.0                                            # Eq. (19): AoI_sat
-METRICS = ["r_tgt", "r_chg", "peak_aoi", "avg_aoi", "data_mb", "deaths", "ugv_out_min", "sensor_out", "diversions",
+METRICS = ["r_tgt", "r_chg", "peak_aoi", "avg_aoi", "data_mb", "deaths", "ugv_out_min", "ugv_drain_min", "sensor_out", "diversions",
            "decisions", "charge_min", "ms_decision", "ms_wm_step"]
-CTRL_KEYS = ("k_token", "k_map", "linear_map", "credit", "gamma", "lam", "clip", "ppo_epochs", "minibatch", "lr", "ent", "vcoef",
+CTRL_KEYS = ("k_token", "k_map", "linear_map", "h_dim", "supply_margin", "warm_start", "bc_episodes", "bc_epochs", "teacher_soc",
+             "ugv_penalty", "credit", "gamma", "lam", "clip", "ppo_epochs", "minibatch", "lr", "ent", "vcoef",
              "ctrl_hidden", "train_episodes", "episodes_per_iter")
 MEM_KEYS = ("hidden", "ren_state", "ren_neurons", "attn_window", "attn_dim", "attn_heads", "attn_layers", "attn_c",
             "penalty", "mixtures", "mem_epochs", "mem_patience", "mem_batch", "mem_lr", "dock_m", "map_max_train",
@@ -135,6 +149,19 @@ def parse(argv=None):
     p.add_argument("--ent", type=float, default=0.01)
     p.add_argument("--vcoef", type=float, default=0.5)
     p.add_argument("--ctrl-hidden", type=int, default=64)
+    p.add_argument("--h-dim", type=int, default=16,
+                   help="memory state given to the controller: its first N principal components (fitted on the "
+                        "training sequences, standardised); 0 = the full state")
+    p.add_argument("--ugv-penalty", type=float, default=1.0,
+                   help="charge-head penalty per minute a UAV sits on a UGV that is at or below the 10%% reserve")
+    p.add_argument("--supply-margin", type=float, default=5.0,
+                   help="shield: a UGV can supply a UAV only above its 10%% reserve plus this (every policy here)")
+    p.add_argument("--warm-start", choices=("greedy", "none"), default="greedy",
+                   help="greedy: before PPO, imitate the greedy policy (destination) and a reserve rule (charge)")
+    p.add_argument("--bc-episodes", type=int, default=48, help="teacher episodes for the warm start")
+    p.add_argument("--bc-epochs", type=int, default=30)
+    p.add_argument("--teacher-soc", type=float, default=40.0,
+                   help="teacher charge rule: charge until the leg to the chosen charger leaves this %% battery")
     p.add_argument("--eval-worlds", type=int, default=30)
     p.add_argument("--quick", action="store_true", help="tiny settings to check the pipeline end to end")
     a, rest = ap.parse_known_args(argv)
@@ -150,6 +177,7 @@ def parse(argv=None):
         a.max_train, a.max_eval, a.map_max_train = 5000, 5000, 3000
         b.max_train, b.max_eval = 5000, 5000
     world_settings(a, b)
+    b.supply_margin = a.supply_margin              # shield setting for every policy this script runs
     return a, b
 
 
@@ -179,8 +207,10 @@ def cmd_fit(a, b):
     mems = [m for m in a.memories if m != "none"]
     todo = [(m, s) for m in mems for s in range(a.seeds)
             if not os.path.exists(os.path.join(mdir, f"mem_{m}_s{s}.pt"))]
+    backfill = [(m, s) for m in mems for s in range(a.seeds) if (m, s) not in todo and
+                "h_pc" not in torch.load(os.path.join(mdir, f"mem_{m}_s{s}.pt"), weights_only=False)]
     vpath = os.path.join(mdir, "vision.pkl")
-    if not todo and os.path.exists(vpath):
+    if not todo and not backfill and os.path.exists(vpath):
         print("fit: V and every M already fitted", flush=True)
         return
     lin = a.linear_map or M.default_linear(a)[0]
@@ -203,20 +233,44 @@ def cmd_fit(a, b):
     din, dz = D["train"]["inp"].shape[2], D["train"]["zs"].shape[2]
     R = np.abs(D["train"]["inp"]).reshape(-1, din).max(0) + 1e-6
     margs = {k: getattr(a, k) for k in vars(a) if isinstance(getattr(a, k), (int, float, str, bool, type(None)))}
+    for mem, seed in backfill:                               # fitted before the principal components were stored
+        f = os.path.join(mdir, f"mem_{mem}_s{seed}.pt")
+        m, d = load_memory(f, b.device)
+        d.update(h_stats(m, D))
+        torch.save(d, f)
+        print(f"fit: {mem} seed {seed}: memory-state principal components added", flush=True)
     for mem, seed in todo:
         t0 = time.time()
         m = L.train(mem, seed, D, a, b)
-        dev = next(m.parameters()).device
-        with torch.no_grad():                               # statistics of the state the controller will read
-            X = torch.tensor(D["train"]["inp"])
-            H = np.concatenate([m(X[i:i + 64].to(dev))[0].flatten(0, 1).cpu().numpy() for i in range(0, len(X), 64)])
         cert = m.certificate() if hasattr(m, "certificate") else (float("nan"),) * 3
         torch.save(dict(arm=mem, seed=seed, state={k: v.cpu() for k, v in m.state_dict().items()}, din=din, dz=dz, R=R,
-                        args=margs, h_mu=H.mean(0), h_sd=H.std(0) + 1e-6, val_nll=m.val_nll, epochs=m.epochs,
+                        args=margs, val_nll=m.val_nll, epochs=m.epochs, **h_stats(m, D),
                         cert=dict(rho=cert[0], L=cert[1], **getattr(m, "extra", {}))),
                    os.path.join(mdir, f"mem_{mem}_s{seed}.pt"))
         print(f"fit: {mem} seed {seed}: {m.epochs} epochs, val NLL {m.val_nll:.3f}, certificate "
               f"rho={cert[0]:.3g} L={cert[1]:.4g}  ({time.time() - t0:.0f}s)", flush=True)
+
+
+def h_stats(m, D):
+    """Statistics of the memory state the controller reads, over the training sequences (teacher forced):
+    per-dimension mean and sd, then the principal components of the standardised state."""
+    dev = next(m.parameters()).device
+    with torch.no_grad():
+        X = torch.tensor(D["train"]["inp"])
+        H = np.concatenate([m(X[i:i + 64].to(dev))[0].flatten(0, 1).cpu().numpy() for i in range(0, len(X), 64)])
+    mu, sd = H.mean(0), H.std(0) + 1e-6
+    Hs = (H - mu) / sd
+    val, vec = np.linalg.eigh(Hs.T @ Hs / len(Hs))
+    o = np.argsort(val)[::-1]
+    return dict(h_mu=mu, h_sd=sd, h_pc=vec[:, o].astype(np.float32), h_pc_sd=np.sqrt(np.maximum(val[o], 1e-12)).astype(np.float32),
+                h_pc_var=(val[o] / val.sum()).astype(np.float32))
+
+
+def h_width(a, mem, seed):
+    if mem == "none":
+        return 0
+    n = len(torch.load(os.path.join(a.ctrl_out, "models", f"mem_{mem}_s{seed}.pt"), weights_only=False)["h_mu"])
+    return min(a.h_dim, n) if a.h_dim > 0 else n
 
 
 def load_memory(path, dev="cpu"):
@@ -236,12 +290,20 @@ class OnlineWM:
     episode, encodes it with the frozen V, and steps the frozen M once per token with the previous token and the
     docking during the previous 5 minutes (the input M was trained on)."""
 
-    def __init__(s, vis, mem=None, mem_meta=None):
+    def __init__(s, vis, mem=None, mem_meta=None, h_dim=0):
         s.v, s.mem = vis, mem
-        s.hd = 0 if mem is None else len(mem_meta["h_mu"])
+        s.hd = 0
         if mem is not None:
+            n = len(mem_meta["h_mu"])
+            s.hd = min(h_dim, n) if h_dim > 0 else n
             s.h_mu, s.h_sd = mem_meta["h_mu"].astype(np.float32), mem_meta["h_sd"].astype(np.float32)
+            s.pc = (mem_meta["h_pc"][:, :s.hd] / mem_meta["h_pc_sd"][None, :s.hd]).astype(np.float32) if h_dim > 0 else None
         s.lags = np.arange(vis["history"]) * vis["history_stride"]
+
+    def h_feat(s, raw):
+        """Memory state as the controller sees it: standardised, then (with --h-dim) its leading components."""
+        z = (raw - s.h_mu) / s.h_sd
+        return (z if s.pc is None else z @ s.pc).astype(np.float32)
 
     def start(s, env, chs, uavs, doy, T, cluster_size, charger_m, n_feat):
         v = s.v
@@ -262,7 +324,7 @@ class OnlineWM:
         s.z_prev = None
         s.h = np.zeros((s.Ku, s.hd), np.float32)
         if s.mem is not None:
-            s.h = (0.0 - s.h_mu)[None].repeat(s.Ku, 0) / s.h_sd     # standardised zero state
+            s.h = s.h_feat(np.zeros((s.Ku, len(s.h_mu)), np.float32))     # the zero state, transformed
         s.state = None
         s.dock = np.zeros(s.Ku)
         s.wm_time, s.wm_steps = 0.0, 0
@@ -291,7 +353,7 @@ class OnlineWM:
                 with torch.no_grad():
                     out = s.mem(torch.from_numpy(x)[:, None, :], s.state)
                 s.state = out[1]
-                s.h = ((out[0][:, -1].numpy() - s.h_mu) / s.h_sd).astype(np.float32)
+                s.h = s.h_feat(out[0][:, -1].numpy())
             s.dock[:] = 0.0
             s.z = s.token(t, uav_xy, alive)
             s.z_prev = s.z
@@ -399,6 +461,9 @@ class CtrlAgent:
             v = s.net.value(q)[0].numpy()
             lpd, lpc = float(pd_.log_prob(torch.tensor(d))), float(pc.log_prob(torch.tensor(c)))
         s.dec_time += time.perf_counter() - t0
+        return s.commit_to(u, here, F, mask, ctx, d, c, lpd, lpc, v)
+
+    def commit_to(s, u, here, F, mask, ctx, d, c, lpd, lpc, v):
         minutes = s.charges[c]
         if minutes > 0:
             u.is_charging = True
@@ -407,6 +472,41 @@ class CtrlAgent:
         s.records.append(dict(F=F, mask=mask, ctx=ctx, here=here, d=d, c=c, lpd=lpd, lpc=lpc, v=v, t=s.t_ref[0],
                               uav=s.uavs.index(u), minutes=minutes))
         return d
+
+
+class TeacherAgent(CtrlAgent):
+    """Warm-start teacher, acting through the controller's interface (same features, same commitment).
+    Destination: greedy on the FLEET's view (each charger's freshest peak AoI over the UAVs, which the token
+    carries) minus flight minutes, skipping chargers another UAV is heading to. The greedy baseline scores the
+    deciding UAV's own AoI record instead, which nothing the controller sees contains, so it cannot be imitated.
+    Charge: the shortest option that leaves at least --teacher-soc % after the leg there (10 %/min below 80 %),
+    none at a UGV at or below 20 %."""
+
+    def __init__(s, wm, charges, teacher_soc):
+        super().__init__(None, wm, charges, False, None)
+        s.teacher_soc = teacher_soc
+
+    def act(s, state):
+        u = s.uav
+        here = u.target.cluster_num
+        com = s.commit.get(id(u))
+        if com is not None and com["here"] is u.target:
+            return com["dest"]
+        F, mask, ctx = s.features(u, here)
+        if not mask.any():
+            return here
+        t = max(s.t_ref[0] - 1, 0)
+        score = s.wm.obs[t, :, 3] * s.wm.T - 60.0 * F[:, -3]        # fleet peak AoI - flight minutes
+        ok = mask & (F[:, -1] == 0)
+        if not ok.any():
+            ok = mask
+        d = int(np.flatnonzero(ok)[np.argmax(score[ok])])
+        need = s.teacher_soc - 100.0 * F[d, -2]
+        ugv_low = not s.is_base[here] and s.chs[here].perceived_soc <= 20.0
+        mins = 0 if need <= 0 or ugv_low else math.ceil(need / 10.0)
+        opts = [k for k, m in enumerate(s.charges) if m >= mins]
+        c = opts[0] if opts else len(s.charges) - 1
+        return s.commit_to(u, here, F, mask, ctx, d, c, 0.0, 0.0, np.zeros(2))
 
 
 class BaselineAgent:
@@ -437,6 +537,7 @@ def run_world(world_seed, b, agent, wm=None):
     from sim_mods.ablation import CFG
     env, info = V.build_world(world_seed, b)
     CFG.charging = "external" if isinstance(agent, CtrlAgent) else "dynamic"
+    CFG.supply_margin = getattr(b, "supply_margin", 0.0)
     ep_rng = np.random.default_rng(world_seed + 1)
     random.seed(world_seed)
     np.random.seed(world_seed % (2 ** 32))
@@ -487,6 +588,7 @@ def run_world(world_seed, b, agent, wm=None):
     r_chg = np.zeros((U, T))
     peak_t, avg_t = np.zeros(T), np.zeros(T)
     ugv_out, sens_out, diversions = 0, 0.0, 0
+    drain = np.zeros((U, T))                  # UAV sat on a UGV at or below the reserve this minute
     seek = np.zeros(U, bool)
     for t in range(T):
         t_ref[0] = t
@@ -525,6 +627,11 @@ def run_world(world_seed, b, agent, wm=None):
         for ch in chs:
             ch.step_battery()
         ugv_out += sum(ch.stored_energy <= V.CH_OUT_SOC for c, ch in enumerate(chs) if not is_base[c])
+        for i, u in enumerate(uavs):
+            tg = u.target
+            if (not dead[i] and tg is not None and tg.type == 2 and not is_base[tg.cluster_num] and u.h == 0
+                    and tg.stored_energy <= V.CH_OUT_SOC):
+                drain[i, t] = 1.0
         data_tot = max(sum(u.state[0][1] for u in uavs), 1)
         age = np.where(dead, t - died_at, 0.0)
         obs = np.zeros((K, len(V.CH_FEATS)), np.float32)
@@ -557,12 +664,12 @@ def run_world(world_seed, b, agent, wm=None):
     n_dec = len(agent.records) if isinstance(agent, CtrlAgent) else 0
     met = dict(r_tgt=r_tgt.mean(), r_chg=r_chg.mean(), peak_aoi=peak_t.mean(), avg_aoi=avg_t.mean(),
                data_mb=sum(u.state[0][1] for u in uavs) / 1e6, deaths=int(dead.sum()),
-               ugv_out_min=float(ugv_out), sensor_out=sens_out / (S * T), diversions=diversions, decisions=n_dec,
+               ugv_out_min=float(ugv_out), ugv_drain_min=float(drain.sum()), sensor_out=sens_out / (S * T), diversions=diversions, decisions=n_dec,
                charge_min=float(np.mean([r["minutes"] for r in agent.records])) if n_dec else float("nan"),
                ms_decision=1e3 * agent.dec_time / max(n_dec, 1) if n_dec else float("nan"),
                ms_wm_step=1e3 * wm.wm_time / max(wm.wm_steps, 1) if wm is not None and wm.mem is not None else float("nan"),
                n_chargers=K, n_ugv=int((~is_base).sum()))
-    return dict(r_tgt=r_tgt, r_chg=r_chg, d_tgt=d_tgt, d_chg=d_aoi, died_at=died_at, records=getattr(agent, "records", []), metrics=met)
+    return dict(r_tgt=r_tgt, r_chg=r_chg, d_tgt=d_tgt, d_chg=d_aoi, drain=drain, died_at=died_at, records=getattr(agent, "records", []), metrics=met)
 
 
 # ==============================================================================================
@@ -571,14 +678,14 @@ def run_world(world_seed, b, agent, wm=None):
 _W = {}
 
 
-def _init_worker(ctrl_out, mem, seed, charging, b, hidden):
+def _init_worker(ctrl_out, mem, seed, charging, b, hidden, h_dim=0):
     torch.set_num_threads(1)
     _W.update(b=b, charges=CHARGE_SETS.get(charging))
     if mem is None:
         return
     vis = pickle.load(open(os.path.join(ctrl_out, "models", "vision.pkl"), "rb"))
     m, meta = (None, None) if mem == "none" else load_memory(os.path.join(ctrl_out, "models", f"mem_{mem}_s{seed}.pt"))
-    _W["wm"] = OnlineWM(vis, m, meta)
+    _W["wm"] = OnlineWM(vis, m, meta, h_dim)
     dc = vis["k_token"] + vis["k_map"] + _W["wm"].hd + 4
     _W["net"] = Controller(dc, len(_W["charges"]), hidden)
     _W["net"].eval()
@@ -594,6 +701,8 @@ def _rollout(job):
             agent = CtrlAgent(_W["net"], _W["wm"], _W["charges"], sample, np.random.default_rng(world))
             torch.manual_seed(world)
             out = run_world(world, _W["b"], agent, _W["wm"])
+        elif kind == "teacher":                                # weights = --teacher-soc here
+            out = run_world(world, _W["b"], TeacherAgent(_W["wm"], _W["charges"], weights), _W["wm"])
         else:
             out = run_world(world, _W["b"], BaselineAgent(kind))
     out["world"] = world
@@ -603,7 +712,7 @@ def _rollout(job):
 def pool(a, mem, seed, charging, b):
     import multiprocessing as mp
     return ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
-                               initargs=(a.ctrl_out, mem, seed, charging, b, a.ctrl_hidden))
+                               initargs=(a.ctrl_out, mem, seed, charging, b, a.ctrl_hidden, a.h_dim))
 
 
 # ==============================================================================================
@@ -627,6 +736,7 @@ def advantages(ep, a):
                 rt, rc = ep["d_tgt"][u, t0:t1], ep["d_chg"][u, t0:t1]
             else:
                 rt, rc = ep["r_tgt"][t0:t1], ep["r_chg"][u, t0:t1]
+            rc = rc - a.ugv_penalty * ep["drain"][u, t0:t1]
             Rs.append((1 - g) * np.array([(w * rt).sum(), (w * rc).sum()]))
             Ds.append(g ** (t1 - t0) if k + 1 < len(rs) else 0.0)
         A = np.zeros((len(rs), 2))
@@ -682,6 +792,39 @@ def ppo_update(net, opt, rows, a, dev):
     return np.mean(stats, 0)
 
 
+def warm_start(net, a, ex, seed, dev, tag):
+    """Imitate the teacher (greedy destination, reserve-rule charge) and fit the values to its returns."""
+    worlds = [TRAIN_WORLD_BASE + seed * 100_000 + 90_000 + i for i in range(a.bc_episodes)]
+    eps = list(ex.map(_rollout, [(w, a.teacher_soc, False, "teacher") for w in worlds]))
+    rows = [r for ep in eps for r in advantages(ep, a)]
+    B = batch_tensors(rows, dev)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    ce = nn.CrossEntropyLoss()
+    net.train()
+    for _ in range(a.bc_epochs):
+        for idx in torch.randperm(len(rows), device=dev).split(a.minibatch):
+            logit, q, e, eh = net(B["F"][idx], B["mask"][idx], B["ctx"][idx], B["here"][idx])
+            cl = net.charge_logits(q, e, eh, B["d"][idx])
+            loss = ce(logit, B["d"][idx]) + ce(cl, B["c"][idx]) + a.vcoef * ((net.value(q) - B["ret"][idx]) ** 2).mean()
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+    net.eval()
+    with torch.no_grad():
+        logit, q, e, eh = net(B["F"], B["mask"], B["ctx"], B["here"])
+        acc_d = (logit.argmax(1) == B["d"]).float().mean().item()
+        acc_c = (net.charge_logits(q, e, eh, B["d"]).argmax(1) == B["c"]).float().mean().item()
+    m = pd.DataFrame([ep["metrics"] for ep in eps]).mean(numeric_only=True)
+    L.append(os.path.join(a.ctrl_out, "ctrl_bc.csv"), dict(
+        arm=tag.split("__")[0], charging=tag.split("__")[1], seed=seed, episodes=len(eps), decisions=len(rows),
+        acc_dest=acc_d, acc_charge=acc_c, **{f"teacher_{k}": m[k] for k in ("r_tgt", "r_chg", "peak_aoi", "ugv_out_min",
+                                                                            "ugv_drain_min", "deaths", "charge_min")}))
+    print(f"train {tag}: warm start on {len(eps)} teacher episodes ({len(rows)} decisions): match greedy "
+          f"destination {acc_d:.0%}, charge {acc_c:.0%}; teacher r_tgt {m['r_tgt']:.3f}, peak AoI {m['peak_aoi']:.0f}",
+          flush=True)
+
+
 def train_one(a, b, mem, charging, seed):
     cdir = os.path.join(a.ctrl_out, "ctrl")
     os.makedirs(cdir, exist_ok=True)
@@ -692,8 +835,7 @@ def train_one(a, b, mem, charging, seed):
     dev = torch.device(b.device)
     torch.manual_seed(seed)
     vis = pickle.load(open(os.path.join(a.ctrl_out, "models", "vision.pkl"), "rb"))
-    hd = 0 if mem == "none" else len(torch.load(os.path.join(a.ctrl_out, "models", f"mem_{mem}_s{seed}.pt"),
-                                                weights_only=False)["h_mu"])
+    hd = h_width(a, mem, seed)
     net = Controller(vis["k_token"] + vis["k_map"] + hd + 4, len(CHARGE_SETS[charging]), a.ctrl_hidden).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     done = 0
@@ -705,6 +847,9 @@ def train_one(a, b, mem, charging, seed):
         print(f"train {tag}: resuming after {done} episodes", flush=True)
     log = os.path.join(a.ctrl_out, "ctrl_train.csv")
     with pool(a, mem, seed, charging, b) as ex:
+        if a.warm_start == "greedy" and not os.path.exists(ckpt):
+            warm_start(net, a, ex, seed, dev, tag)
+            torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), episodes=0), ckpt)
         while done < a.train_episodes:
             t0 = time.time()
             n = min(a.episodes_per_iter, a.train_episodes - done)
@@ -791,7 +936,8 @@ def cmd_eval(a, b):
             L.append(path, dict(arm=mem, charging=charging, seed=seed, world=o["world"], **o["metrics"]))
         m = pd.DataFrame([o["metrics"] for o in outs]).mean(numeric_only=True)
         print(f"eval {mem} {charging} seed {seed}: r_tgt {m['r_tgt']:.3f}  peak AoI {m['peak_aoi']:.0f}  "
-              f"deaths {m['deaths']:.2f}  UGV-out {m['ugv_out_min']:.0f} min", flush=True)
+              f"deaths {m['deaths']:.2f}  UGV-out {m['ugv_out_min']:.0f} min  on drained UGVs {m['ugv_drain_min']:.0f} min",
+              flush=True)
 
 
 def cmd_report(a, b):
@@ -815,7 +961,7 @@ def cmd_report(a, b):
         if arm != "lstm" and len(lstm):
             refs.append(("lstm", lstm))
         for name, ref in refs:
-            for k in METRICS[:9]:
+            for k in METRICS[:10]:
                 diffs = []
                 for s, gs in g.groupby("seed"):
                     gs = gs.set_index("world")
@@ -831,7 +977,7 @@ def cmd_report(a, b):
     pd.DataFrame(paired).to_csv(os.path.join(a.ctrl_out, "ctrl_paired.csv"), index=False)
     pd.set_option("display.width", 250)
     print(summ[["arm", "charging", "n_seeds", "r_tgt", "r_tgt_ci95", "r_chg", "peak_aoi", "avg_aoi", "deaths",
-                "ugv_out_min", "diversions", "charge_min", "ms_decision"]].round(3).to_string(index=False))
+                "ugv_out_min", "ugv_drain_min", "diversions", "charge_min", "ms_decision"]].round(3).to_string(index=False))
 
 
 def main(argv=None):

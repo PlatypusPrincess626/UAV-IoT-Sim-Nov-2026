@@ -464,7 +464,12 @@ class QuadUAV:
                 train_p = self._charge_dynamic(dist, peak)
             elif CFG.charging == "external":
                 # Ctrl_test.py: the targeting model sets is_charging / p_count itself when it picks the next
-                # charger (charge here first, then leave); only the shared exit rules below apply
+                # charger (charge here first, then leave). It stops here when the committed minutes run out or
+                # the battery passes 80 %: the shared exit below sits in an elif behind changed_transit, which
+                # the targeting model reports on every decision, so it would never end the charge.
+                if self.is_charging and (self.p_count < 1.0 or self.state[0][2] > 0.8 * ablation.batt_full()):
+                    self.p_count = 0
+                    self.is_charging = False
                 train_p = False
             else:
                 train_p = self._charge_model(action_p)
@@ -578,7 +583,7 @@ class QuadUAV:
             guaranteed charger, and the CH here cannot supply. If it can, the UAV charges here instead.
         """
         here = self.target
-        here_supplies = getattr(here, "is_base", False) or (here.stored_energy > 10.0 + 1e-6
+        here_supplies = getattr(here, "is_base", False) or (here.stored_energy > 10.0 + CFG.supply_margin + 1e-6
                                                            and self.short_minutes < CFG.divert_after)
         if self.is_charging:
             if self.short_minutes < CFG.divert_after:

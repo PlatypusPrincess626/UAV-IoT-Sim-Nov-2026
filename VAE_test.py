@@ -1135,6 +1135,27 @@ def summarise(track, a):
     return s
 
 
+def cmd_features(a):
+    """pca_feature_kept.csv: for every token feature (each fleet observation at each lag, then the time,
+    cluster and distance features), the share of its training variance a k-component PCA keeps. Use it to
+    check that what a controller needs (AoI, time since contact) survives the --k-token you choose."""
+    from sklearn.decomposition import PCA
+    (Xtr, _, _), _, _ = load_track("ch", a)
+    names = [f"{f}@-{l * a.history_stride}m".replace("@-0m", "@now") for l in range(a.history) for f in CH_FEATS]
+    names += ["day_phase", "doy_sin", "doy_cos", "sun_elev", "cluster_size", "nearest_uav_dist", "base_dist"]
+    ks = [k for k in (2, 4, 8, 16, 32) if k <= min(Xtr.shape)]
+    p = PCA(max(ks)).fit(Xtr)
+    tot = np.maximum(Xtr.var(0), 1e-12)
+    kept = {f"kept@k{k}": (p.components_[:k] ** 2 * p.explained_variance_[:k, None]).sum(0) / tot for k in ks}
+    df = pd.DataFrame(kept, index=names[:Xtr.shape[1]])
+    df.loc["(all features)"] = [p.explained_variance_ratio_[:k].sum() for k in ks]
+    df.index.name = "feature"
+    path = os.path.join(a.out, "pca_feature_kept.csv")
+    df.to_csv(path)
+    print(f"wrote {path}; current-time AoI and contact features:")
+    print(df.loc[[n for n in df.index if n.endswith("@now")] + ["(all features)"]].round(2).to_string(), flush=True)
+
+
 def cmd_report(a):
     """
     Comparisons are made on VALIDATION episodes: the best deployable linear method at each budget is
@@ -1219,7 +1240,7 @@ def cmd_report(a):
 # =====================================================================================
 def parse(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("collect", "sufficiency", "run", "report", "all"))
+    ap.add_argument("command", choices=("collect", "sufficiency", "run", "report", "features", "all"))
     ap.add_argument("--out", default="vae_test_out")
     ap.add_argument("--quick", action="store_true", help="tiny run of the whole pipeline to check it works")
     w = ap.add_argument_group("world")
@@ -1344,6 +1365,8 @@ def main(argv=None):
         cmd_run(a)
     if a.command in ("report", "all"):
         cmd_report(a)
+    if a.command in ("report", "features", "all"):
+        cmd_features(a)
 
 
 if __name__ == "__main__":

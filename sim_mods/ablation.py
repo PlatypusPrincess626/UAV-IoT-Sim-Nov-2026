@@ -36,6 +36,10 @@ class AblationConfig:
     # data from that CH exceeds the CH's total uploads to every UAV, which with several UAVs almost never
     # happens, so swept sensors keep their age; "visit" refreshes each sensor's age when a UAV collects from it.
     sortie_credit: str = "gated"
+    # Charger shield: a UGV counts as able to supply only above its 10 % reserve plus this margin. At 0 (as
+    # collected) a UGV held just above 10 % by its solar trickle passes the check, so a UAV whose next leg
+    # needs more battery is told to charge there again and again and never leaves. Ctrl_test.py sets 5.
+    supply_margin: float = 0.0
     charger_divert: bool = False
     divert_after: int = 2
     divert_min_soc: float = 30.0
