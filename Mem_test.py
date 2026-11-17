@@ -92,20 +92,26 @@ def parse(argv=None):
 # Sequences
 # ----------------------------------------------------------------------------------------------
 def episode_sequences(f, a, b):
+    """One sequence per token row (UGV, or (UAV, UGV) with --knowledge local) over the day: tokens X (R, n, D),
+    hidden truth Y (R, n, 4), action A (R, n, 1), the UGV's map patch P (R, 2, 32, 32) and Mk (R, n), whether
+    the map is known (None in fleet mode). Action = docking during the step: the number of UAVs within --dock-m
+    (fleet), or the share of the step this UAV was landed on this UGV (local). Local: a UGV's map (its local
+    canopy and terrain) is known once the UAV has any information from it (since_contact@now < 1)."""
     d = dict(np.load(f))
-    ugv = ~d["is_base"] if "is_base" in d else np.ones(d["ch_obs"].shape[1], bool)
-    X, Y = V.ch_tokens(d, b, None, None)                       # rows ordered step-major, then UGV
-    K = int(ugv.sum())
-    n = len(X) // K
-    X = X.reshape(n, K, -1).transpose(1, 0, 2)
-    Y = Y.reshape(n, K, 4).transpose(1, 0, 2)
+    X, Y, _, ugv, uav = V.token_grid(d, b)
+    X, Y = X.transpose(1, 0, 2), Y.transpose(1, 0, 2)
     T = d["ch_obs"].shape[0]
     steps = np.arange(0, T, b.token_every)
-    dxy = d["uav_xy"][:, None, :, :] - d["ch_xy"][ugv][None, :, None, :]
-    docked = ((np.hypot(dxy[..., 0], dxy[..., 1]) < a.dock_m) & d["uav_alive"][:, None, :]).sum(2)   # (T, K)
-    A = np.stack([docked[s:s + b.token_every].mean(0) for s in steps], 1)[..., None]                 # (K, n, 1)
+    if uav[0] >= 0:
+        on = d["uav_docked"][:, uav] == ugv[None, :]                                                   # (T, R)
+        A = np.stack([on[s:s + b.token_every].mean(0) for s in steps], 1)[..., None]
+    else:
+        dxy = d["uav_xy"][:, None, :, :] - d["ch_xy"][ugv][None, :, None, :]
+        docked = ((np.hypot(dxy[..., 0], dxy[..., 1]) < a.dock_m) & d["uav_alive"][:, None, :]).sum(2)   # (T, K)
+        A = np.stack([docked[s:s + b.token_every].mean(0) for s in steps], 1)[..., None]                 # (K, n, 1)
     P = d["patches"][d["kinds"] == 2][ugv].astype(np.float64)
-    return X, Y, A.astype(np.float64), P
+    Mk = (X[..., 1] < 1.0).astype(np.float64) if uav[0] >= 0 else None
+    return X.astype(np.float64), Y.astype(np.float64), A.astype(np.float64), P, Mk
 
 
 def load_sequences(a, b):
@@ -115,17 +121,19 @@ def load_sequences(a, b):
     mmu, msd = b._map_stats
     out = {}
     for name, fs in zip(("train", "val", "test"), parts):
-        Xs, Ys, As, Ps = [], [], [], []
+        Xs, Ys, As, Ps, Ms = [], [], [], [], []
         for f in fs:
-            X, Y, A, P = episode_sequences(f, a, b)
+            X, Y, A, P, Mk = episode_sequences(f, a, b)
+            Ms.append(Mk)
             Xs.append(np.clip((X - mu) / sd, -b.z_clip, b.z_clip))
             Ys.append(Y)
             As.append(A)
             Ps.append((P - mmu[0]) / msd[0])
-        out[name] = dict(X=np.concatenate(Xs), Y=np.concatenate(Ys), A=np.concatenate(As), P=np.concatenate(Ps))
+        out[name] = dict(X=np.concatenate(Xs), Y=np.concatenate(Ys), A=np.concatenate(As), P=np.concatenate(Ps),
+                         Mk=None if Ms[0] is None else np.concatenate(Ms))
         Y = out[name]["Y"].reshape(-1, 4)
         onset = int((Y[Y[:, 3] == 0, 1]).sum())
-        print(f"{name}: {len(out[name]['X'])} UGV-day sequences x {out[name]['X'].shape[1]} steps "
+        print(f"{name}: {len(out[name]['X'])} token-row-day sequences x {out[name]['X'].shape[1]} steps "
               f"from {len(fs)} episodes; outage-onset samples {onset}", flush=True)
         out[name]["onset"] = onset
     return out
@@ -218,9 +226,13 @@ def build_memory(din, dz, a):
     return MDNRNN()
 
 
-def to_inputs(Zt, Zm, A):
-    """(N, n, dz), (N, dm), (N, n, da) -> (N, n, dz + dm + da)."""
-    return np.concatenate([Zt, np.repeat(Zm[:, None, :], Zt.shape[1], 1), A], 2).astype(np.float32)
+def to_inputs(Zt, Zm, A, Mk=None):
+    """(N, n, dz), (N, dm), (N, n, da) -> (N, n, dz + dm + da). Mk (N, n): 1 where the map is known to whoever
+    holds this view (--knowledge local: the UAV has heard from that charger); an unknown map is 0, the mean."""
+    Zm = np.repeat(Zm[:, None, :], Zt.shape[1], 1)
+    if Mk is not None:
+        Zm = Zm * Mk[..., None]
+    return np.concatenate([Zt, Zm, A], 2).astype(np.float32)
 
 
 def train_memory(seed, D, a, b, noise=None):
@@ -343,7 +355,8 @@ def run_config(kind, seed, a, b, ch, mp, S, cache, mode="clean"):
     mmu, msd = D["train"]["Zm"].mean(0), D["train"]["Zm"].std(0) + 1e-9
     for name in D:
         zs = (D[name]["Zt"] - zmu) / zsd
-        D[name].update(zs=zs, inp=to_inputs(zs, (D[name]["Zm"] - mmu) / msd, S[name]["A"]), X=S[name]["X"])
+        D[name].update(zs=zs, inp=to_inputs(zs, (D[name]["Zm"] - mmu) / msd, S[name]["A"], S[name].get("Mk")),
+                       X=S[name]["X"])
     noise = None
     if mode == "sampled":                                # per-sample posterior sigma, in standardised units
         N, n, _ = S["train"]["X"].shape
@@ -369,7 +382,7 @@ def run_config(kind, seed, a, b, ch, mp, S, cache, mode="clean"):
             row.update({f"{name}_{k}": v for k, v in r.items()})
         N, n, _ = Hh.shape
         z = D[name]["zs"].reshape(N * n, -1)
-        zm = np.repeat((D[name]["Zm"] - mmu) / msd, n, 0)
+        zm = D[name]["inp"][..., a.k_token:-1].reshape(N * n, -1)          # the map latent M was given
         feats[name] = (np.concatenate([z, zm, Hh.reshape(N * n, -1)], 1), np.concatenate([z, zm], 1),
                        S[name]["Y"].reshape(N * n, 4))
     for tag, col in (("mem", 0), ("zonly", 1)):

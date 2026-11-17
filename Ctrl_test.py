@@ -26,36 +26,52 @@ Memory arms (--memories, ablation over everything Lyap_test.py compared)
   attn            L2 self-attention over a 2 h window
   lren@rgG        Lipschitz-bounded REN: contraction r and input -> prediction gain <= G certified
 
-Charging modes (--charging)
-  duration        charge here for 0 / 5 / 10 / 15 / 20 min before leaving (the paper's power-DDQN actions)
-  binary          leave now, or charge before leaving (until 80 % or 20 min, the simulator's charge exit)
+Charging (--charging binary, default): leave now, or charge here first (until 80 % or 20 min, the
+  simulator's charge exit). --charging duration (0 / 5 / 10 / 15 / 20 min) is kept for comparison.
+
+Knowledge (the episodes must be collected with VAE_test.py --knowledge local)
+  Each UAV runs its own world model on what it alone knows: its own contacts, charges and uploads, the state of
+  the charger it is at, and records swapped with another UAV while both are airborne within PLoRa range with
+  line of sight (VAE_test.UAVKnowledge). Every charger, the base station included, gets a token from that UAV's
+  view (its last reading of the charger, minutes since, AoI, its own data share, the time, its distance to the
+  charger and its own battery), compressed by V; M keeps one memory state per (UAV, UGV) (the base station has
+  no hidden state: its memory state is M's zero state). A charger's map latent (its local canopy/shade and
+  terrain, which that charger holds) is known to a UAV once it has heard from that charger, directly or
+  relayed; until then it is 0 (the mean). Terrain and charger locations are known to all (every CH holds them).
+  Destination predictor (DestNet, part of the world model): for every other UAV j it forecasts where j is
+  heading, from what this UAV knows of j (destination last heard, how long ago, j's position and battery then)
+  and its own latent of each charger. A record heard this minute is the truth. Trained on the collected
+  episodes (true destinations); accuracy by record age, against "last heard" and uniform guesses, is in
+  dest_pred.csv.
 
 Decision (one per visit, when the UAV is at a charger and has no sensor sortie left there)
-  For every charger c (UGV cluster heads and the base station) the controller builds
-      [z_c (k_token), z_map_c (k_map), h_c (memory state, standardised), is_base,
-       flight hours here -> c, battery after that leg / 100, other UAVs already heading to c / U]
-  The base station has no hidden state and is not compressed, so its z, z_map and h are zeros. The UAV's own
-  battery, the leg lengths and the other UAVs' targets are not in the world model (it describes UGVs), so they
-  are given to the controller directly. Context: [UAV battery / 100, time of day, sun elevation].
-  A shared encoder embeds every charger (so the number of chargers can change per world); the destination is
-  a softmax over chargers (the current one masked); the charge choice is conditioned on the chosen
-  destination and the current charger. h_c comes from M after it has consumed the UGV's tokens and docking up
-  to the previous 5-minute step (World Models: h_t summarises z_<t, a_<t); z_c is the latest token.
+  The controller sees only the world model's output: for every charger c, [z_c, z_map_c, h_c, o_c] from this
+  UAV's world model, o_c being the forecast share of the other UAVs heading to c (the destination predictor).
+  Nothing else (no raw distances, batteries or other UAVs' targets): the UAV's battery and its distance to
+  each charger reach it only through z. z is re-encoded from the UAV's knowledge when it decides, and its
+  choice is announced to the UAVs it is linked with. A shared encoder embeds every charger (so the number of
+  chargers can change per world); the destination is a softmax over chargers (the current one masked); the
+  charge choice is conditioned on the chosen destination and the current charger. h_c comes from M after it
+  consumed the tokens and the UAV's docking up to the previous 5-minute step (World Models: h_t summarises
+  z_<t, a_<t); z_c is the latest token.
 
 Memory state (--h-dim 16): the controller gets the first 16 principal components of M's standardised state
   (fitted on the training sequences), so every memory arm hands it the same small input; 0 = the full state.
 
 Warm start (--warm-start greedy): before PPO the controller imitates a teacher acting through the same
-  features: greedy on the fleet's view of each charger's peak AoI minus flight time (skipping chargers another
-  UAV is heading to), charging the shortest option that leaves --teacher-soc % after the leg. Values are fitted
-  to the teacher's returns. Imitation accuracy is in ctrl_bc.csv. PPO then improves on it.
+  interface on the same UAV-local knowledge: greedy on the UAV's own estimate of each charger's peak AoI minus
+  flight time, skipping chargers its world model forecasts another UAV is heading to, charging when the leg
+  would leave less than --teacher-soc %. Values are fitted to
+  the teacher's returns; imitation accuracy is in ctrl_bc.csv. PPO then improves on it, gently (--lr 1e-4,
+  --ent 0.001), and every --val-every episodes the greedy-action policy is scored on --val-worlds held-out
+  worlds; the best one (the warm start included) is kept.
 
 Safety shield (on): the simulator's reserve check and charger diversion stay active underneath the controller
   (a UAV whose next leg would breach the reserve tops up first; a UAV whose UGV cannot supply diverts to the best
   reachable charger). The controller's choice is what PPO is trained on; the shield is part of the environment.
-  Sensor sorties (cached nearest-neighbour + 2-opt tour) are unchanged. --supply-margin 5: a UGV counts as able
-  to supply only above 15 %, for every policy run here (at 0 a UGV held at 10 % by its solar trickle trapped
-  UAVs in a charge-again loop).
+  Sensor sorties (cached nearest-neighbour + 2-opt tour) are unchanged. Every world uses the settings the
+  episodes were collected with, including the supply margin (VAE_test.py --supply-margin, 5 by default: a UGV
+  supplies only above 15 %).
 
 Rewards (the paper's equations, fleet view): every minute
       R_peak = max(1 - max_c peak AoI_c / 120, 0)   R_avg = max(1 - mean_c avg AoI_c / t, 0)   (Eqs. 18, 19)
@@ -76,9 +92,10 @@ Baselines (always evaluated): greedy (highest AoI minus flight time), random seq
 
 Outputs (in --ctrl-out, default <out>/controller)
   models/vision.pkl, models/mem_<arm>_s<seed>.pt      frozen V and M
+  models/dest.pt, dest_pred.csv                        destination predictor and its accuracy
   ctrl/<arm>__<charging>__s<seed>.pt                    trained controller (ckpt_*.pt while training)
   ctrl_bc.csv         warm start: imitation accuracy and the teacher's own scores
-  ctrl_train.csv      learning curve: one row per PPO iteration
+  ctrl_train.csv      learning curve: one row per PPO iteration (val_r_tgt when validated; best = kept)
   ctrl_eval.csv       one row per (arm, charging, seed, world); the eval step resumes from it
   ctrl_summary.csv    per arm: mean and 95 % CI over seeds (baselines: over worlds)
   ctrl_paired.csv     paired gaps per seed vs the greedy baseline and vs the lstm arm with the same charging
@@ -86,7 +103,7 @@ Outputs (in --ctrl-out, default <out>/controller)
 Run
   python Ctrl_test.py all --out vae_test_out --k-token 16 --workers 16    # fit, train, eval, report
   python Ctrl_test.py all --out vae_test_out --seeds 3 --memories none lstm lren@0.97g100   # a first pass
-  python Ctrl_test.py train --memories lren@0.97g100 --charging binary --force   # retrain those controllers
+  python Ctrl_test.py train --memories lren@0.97g100 --force   # retrain those controllers
 """
 import argparse
 import math
@@ -109,13 +126,13 @@ V = M.V
 CHARGE_SETS = {"duration": [0, 5, 10, 15, 20], "binary": [0, 20]}
 BASELINES = ("greedy", "random", "rotation")
 DEFAULT_MEMORIES = ["none", "lstm", "lstm_diss@0.97", "ren@0.97", "attn", "lren@0.97g30", "lren@0.97g100"]
-TRAIN_WORLD_BASE, EVAL_WORLD_BASE = 200_000, 900_000       # VAE_test data uses seed_base (1000) + episode
+TRAIN_WORLD_BASE, VAL_WORLD_BASE, EVAL_WORLD_BASE = 200_000, 800_000, 900_000   # data: seed_base (1000) + episode
 AOI_SAT = 120.0                                            # Eq. (19): AoI_sat
 METRICS = ["r_tgt", "r_chg", "peak_aoi", "avg_aoi", "data_mb", "deaths", "ugv_out_min", "ugv_drain_min", "sensor_out", "diversions",
            "decisions", "charge_min", "ms_decision", "ms_wm_step"]
-CTRL_KEYS = ("k_token", "k_map", "linear_map", "h_dim", "supply_margin", "warm_start", "bc_episodes", "bc_epochs", "teacher_soc",
+CTRL_KEYS = ("k_token", "k_map", "linear_map", "h_dim", "warm_start", "bc_episodes", "bc_epochs", "teacher_soc",
              "ugv_penalty", "credit", "gamma", "lam", "clip", "ppo_epochs", "minibatch", "lr", "ent", "vcoef",
-             "ctrl_hidden", "train_episodes", "episodes_per_iter")
+             "ctrl_hidden", "train_episodes", "episodes_per_iter", "val_worlds", "val_every")
 MEM_KEYS = ("hidden", "ren_state", "ren_neurons", "attn_window", "attn_dim", "attn_heads", "attn_layers", "attn_c",
             "penalty", "mixtures", "mem_epochs", "mem_patience", "mem_batch", "mem_lr", "dock_m", "map_max_train",
             "lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "token_every", "history",
@@ -128,7 +145,7 @@ def parse(argv=None):
     ap.add_argument("--ctrl-out", default=None, help="results folder (default <out>/controller)")
     ap.add_argument("--memories", nargs="+", default=DEFAULT_MEMORIES,
                     help="memory arms: none, lstm, lstm_diss@r, ren@r, attn, lren@<r>g<gamma>")
-    ap.add_argument("--charging", nargs="+", default=["duration", "binary"], choices=list(CHARGE_SETS))
+    ap.add_argument("--charging", nargs="+", default=["binary"], choices=list(CHARGE_SETS))
     ap.add_argument("--baselines", nargs="*", default=list(BASELINES), choices=BASELINES)
     ap.add_argument("--force", action="store_true",
                     help="delete the trained controllers and eval rows of the selected memories x charging modes "
@@ -145,8 +162,8 @@ def parse(argv=None):
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--minibatch", type=int, default=256)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--ent", type=float, default=0.01)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--ent", type=float, default=0.001)
     p.add_argument("--vcoef", type=float, default=0.5)
     p.add_argument("--ctrl-hidden", type=int, default=64)
     p.add_argument("--h-dim", type=int, default=16,
@@ -154,15 +171,16 @@ def parse(argv=None):
                         "training sequences, standardised); 0 = the full state")
     p.add_argument("--ugv-penalty", type=float, default=1.0,
                    help="charge-head penalty per minute a UAV sits on a UGV that is at or below the 10%% reserve")
-    p.add_argument("--supply-margin", type=float, default=5.0,
-                   help="shield: a UGV can supply a UAV only above its 10%% reserve plus this (every policy here)")
     p.add_argument("--warm-start", choices=("greedy", "none"), default="greedy",
                    help="greedy: before PPO, imitate the greedy policy (destination) and a reserve rule (charge)")
     p.add_argument("--bc-episodes", type=int, default=48, help="teacher episodes for the warm start")
     p.add_argument("--bc-epochs", type=int, default=30)
     p.add_argument("--teacher-soc", type=float, default=40.0,
                    help="teacher charge rule: charge until the leg to the chosen charger leaves this %% battery")
+    p.add_argument("--val-worlds", type=int, default=8, help="held-out worlds for picking the best checkpoint")
+    p.add_argument("--val-every", type=int, default=60, help="training episodes between validations")
     p.add_argument("--eval-worlds", type=int, default=30)
+    p.add_argument("--dest-max-train", type=int, default=300_000, help="pairs for the destination predictor")
     p.add_argument("--quick", action="store_true", help="tiny settings to check the pipeline end to end")
     a, rest = ap.parse_known_args(argv)
     # V and M settings: Lyap_test.py's parser (and through it VAE_test.py's)
@@ -173,11 +191,11 @@ def parse(argv=None):
     a.ctrl_out = a.ctrl_out or os.path.join(a.out, "controller")
     if a.quick:
         a.train_episodes, a.episodes_per_iter, a.eval_worlds, a.ppo_epochs = 4, 2, 2, 2
+        a.val_worlds, a.val_every, a.bc_episodes, a.bc_epochs = 2, 2, 2, 2
         a.mem_epochs = a.lren_epochs = 2
         a.max_train, a.max_eval, a.map_max_train = 5000, 5000, 3000
         b.max_train, b.max_eval = 5000, 5000
     world_settings(a, b)
-    b.supply_margin = a.supply_margin              # shield setting for every policy this script runs
     return a, b
 
 
@@ -186,8 +204,12 @@ def world_settings(a, b):
     import json
     p = os.path.join(a.out, "data", "world_config.json")
     if os.path.exists(p):
-        for k, v in json.load(open(p)).items():
+        cfg = {**V.LEGACY, **json.load(open(p))}
+        for k, v in cfg.items():
             setattr(b, k, tuple(v) if isinstance(v, list) and k not in ("policy_cycle",) else v)
+    if getattr(b, "knowledge", "fleet") != "local":
+        raise SystemExit(f"{p}: the controller needs episodes collected with --knowledge local (each UAV's own "
+                         "knowledge); this folder has the fleet-shared view. Collect into a new --out.")
     b.verbose = False
 
 
@@ -210,7 +232,7 @@ def cmd_fit(a, b):
     backfill = [(m, s) for m in mems for s in range(a.seeds) if (m, s) not in todo and
                 "h_pc" not in torch.load(os.path.join(mdir, f"mem_{m}_s{s}.pt"), weights_only=False)]
     vpath = os.path.join(mdir, "vision.pkl")
-    if not todo and not backfill and os.path.exists(vpath):
+    if not todo and not backfill and os.path.exists(vpath) and os.path.exists(os.path.join(mdir, "dest.pt")):
         print("fit: V and every M already fitted", flush=True)
         return
     lin = a.linear_map or M.default_linear(a)[0]
@@ -233,6 +255,10 @@ def cmd_fit(a, b):
     din, dz = D["train"]["inp"].shape[2], D["train"]["zs"].shape[2]
     R = np.abs(D["train"]["inp"]).reshape(-1, din).max(0) + 1e-6
     margs = {k: getattr(a, k) for k in vars(a) if isinstance(getattr(a, k), (int, float, str, bool, type(None)))}
+    dpath = os.path.join(mdir, "dest.pt")
+    if not os.path.exists(dpath):
+        state, f = fit_dest(a, b, pickle.load(open(vpath, "rb")), torch.device(b.device))
+        torch.save(dict(state=state, f=f), dpath)
     for mem, seed in backfill:                               # fitted before the principal components were stored
         f = os.path.join(mdir, f"mem_{mem}_s{seed}.pt")
         m, d = load_memory(f, b.device)
@@ -249,6 +275,142 @@ def cmd_fit(a, b):
                    os.path.join(mdir, f"mem_{mem}_s{seed}.pt"))
         print(f"fit: {mem} seed {seed}: {m.epochs} epochs, val NLL {m.val_nll:.3f}, certificate "
               f"rho={cert[0]:.3g} L={cert[1]:.4g}  ({time.time() - t0:.0f}s)", flush=True)
+
+
+# ==============================================================================================
+# Destination predictor (part of the world model)
+# ==============================================================================================
+class DestNet(nn.Module):
+    """Scores every charger as the destination of another UAV j, from what UAV i knows: i's latent of the charger
+    and i's record of j (destination heard, how long ago, j's position and battery then)."""
+
+    def __init__(s, f, H=64):
+        super().__init__()
+        s.net = nn.Sequential(nn.Linear(f, H), nn.Tanh(), nn.Linear(H, H), nn.Tanh(), nn.Linear(H, 1))
+        s.stay = nn.Sequential(nn.Linear(2, 16), nn.Tanh(), nn.Linear(16, 1))   # trust in the destination heard
+        with torch.no_grad():
+            s.stay[2].bias.fill_(3.0)
+
+    def forward(s, F, valid):
+        """Starts from the destination last heard (a learned trust that depends on its age and the battery
+        then) and adds the network's correction for every charger."""
+        trust = s.stay(F[..., 0, -2:]).squeeze(-1)                     # [age, battery] are the same for every c
+        logit = s.net(F).squeeze(-1) + trust[..., None] * F[..., -3]   # F[..., -3]: heard destination == c
+        return logit.masked_fill(~valid, -1e9)
+
+
+def dest_features(z, peer, ch_xy):
+    """z (..., K, k) UAV i's latents of the chargers; peer (..., 5) its record of UAV j; ch_xy (K, 2) / dim.
+    -> (..., K, k + 4): [z, distance from j's last known position, heard destination == charger, age, battery]."""
+    K = z.shape[-2]
+    d = np.hypot(peer[..., None, 2] - ch_xy[:, 0], peer[..., None, 3] - ch_xy[:, 1])
+    known = (peer[..., None, 0] == np.arange(K)).astype(np.float32)
+    rep = lambda v: np.broadcast_to(v[..., None], d.shape)
+    return np.concatenate([z, d[..., None], known[..., None], rep(peer[..., 1])[..., None],
+                           rep(peer[..., 4])[..., None]], -1).astype(np.float32)
+
+
+def dest_data(files, vis, b, cap, rng):
+    """Training pairs (UAV i's view, UAV j's true destination) every token step: features (N, Kmax, f), valid,
+    target, and the age of i's record of j."""
+    mu, sd = vis["ch_stats"]
+    out = []
+    for f in files:
+        d = dict(np.load(f))
+        X, _, _, ugv, uav = V.token_grid(d, b, include_base=True)
+        n, R, D = X.shape
+        U, K = d["uv_peer"].shape[1], len(d["ch_xy"])
+        z = ((vis["tok"].enc(np.clip((X.reshape(n * R, D) - mu) / sd, -b.z_clip, b.z_clip)) - vis["zmu"]) / vis["zsd"])
+        z = z.reshape(n, U, K, -1).astype(np.float32)
+        steps = np.arange(0, d["ch_obs"].shape[0], b.token_every)
+        peer, dest = d["uv_peer"][steps], d["uav_dest"][steps]                    # (n, U, U, 5), (n, U)
+        alive = d["uav_alive"][steps]
+        s_, i_, j_ = np.nonzero(alive[:, :, None] & alive[:, None, :] & ~np.eye(U, dtype=bool)[None]
+                                & (dest[:, None, :] >= 0))
+        if cap and len(s_) > cap:
+            k = rng.choice(len(s_), cap, replace=False)
+            s_, i_, j_ = s_[k], i_[k], j_[k]
+        Fe = dest_features(z[s_, i_], peer[s_, i_, j_], d["ch_xy"] / float(d["dim"]))
+        out.append((Fe, dest[s_, j_].astype(int), peer[s_, i_, j_, 1] * V.EPISODE_STEPS, peer[s_, i_, j_, 0]))
+    Kmax = max(o[0].shape[1] for o in out)
+    pad = lambda F: np.pad(F, ((0, 0), (0, Kmax - F.shape[1]), (0, 0)))
+    F = np.concatenate([pad(o[0]) for o in out])
+    valid = np.concatenate([np.arange(Kmax)[None] < o[0].shape[1] for o in out for _ in range(len(o[0]))])
+    return F, valid, np.concatenate([o[1] for o in out]), np.concatenate([o[2] for o in out]), \
+        np.concatenate([o[3] for o in out])
+
+
+def fit_dest(a, b, vis, dev):
+    """Train the destination predictor on the training episodes, early-stop on validation, report on test."""
+    files = sorted(V.glob.glob(os.path.join(a.out, "data", "ep_*.npz")))
+    split = dict(zip(("train", "val", "test"), V.split_episodes(files, b)))
+    rng = np.random.default_rng(0)
+    cap = max(a.dest_max_train // max(len(split["train"]), 1), 50)
+    data = {k: dest_data(split[k], vis, b, cap if k == "train" else cap // 2, rng) for k in ("train", "val", "test")}
+    tt = lambda x, dt=torch.float32: torch.tensor(x, dtype=dt)
+    F, Vd, y = tt(data["train"][0]), tt(data["train"][1], torch.bool), tt(data["train"][2], torch.long)
+    net = DestNet(F.shape[2]).to(dev)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    ce = nn.CrossEntropyLoss()
+
+    def nll(k):
+        Fk, Vk, yk = (tt(data[k][0]).to(dev), tt(data[k][1], torch.bool).to(dev), tt(data[k][2], torch.long).to(dev))
+        with torch.no_grad():
+            lg = torch.cat([net(Fk[i:i + 4096], Vk[i:i + 4096]) for i in range(0, len(Fk), 4096)])
+        return ce(lg, yk).item(), lg.argmax(1).cpu().numpy(), torch.log_softmax(lg, 1).cpu().numpy()
+
+    best, bad, state = np.inf, 0, None
+    for ep in range(60):
+        net.train()
+        for idx in torch.randperm(len(F)).split(1024):
+            loss = ce(net(F[idx].to(dev), Vd[idx].to(dev)), y[idx].to(dev))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        net.eval()
+        v = nll("val")[0]
+        if v < best - 1e-4:
+            best, bad, state = v, 0, {k: x.detach().cpu().clone() for k, x in net.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= 5:
+                break
+    net.load_state_dict(state)
+    rows = []
+    for k in ("val", "test"):
+        _, pred, lp = nll(k)
+        yk, age, heard = data[k][2], data[k][3], data[k][4]
+        for lo, hi, name in ((0, 1, "0 min"), (1, 6, "1-5 min"), (6, 16, "6-15 min"), (16, 31, "16-30 min"),
+                             (31, 10_000, ">30 min")):
+            sel = (age >= lo) & (age < hi)
+            if sel.sum() == 0:
+                continue
+            nv = data[k][1][sel].sum(1)
+            rows.append(dict(split=k, age=name, n=int(sel.sum()), acc=float((pred[sel] == yk[sel]).mean()),
+                             nll=float(-lp[sel, yk[sel]].mean()), acc_last_heard=float((heard[sel] == yk[sel]).mean()),
+                             acc_uniform=float((1.0 / nv).mean()), nll_uniform=float(np.log(nv).mean())))
+    pd.DataFrame(rows).to_csv(os.path.join(a.ctrl_out, "dest_pred.csv"), index=False)
+    t = pd.DataFrame(rows)
+    t = t[t.split == "test"]
+    print("fit: destination predictor (test): " + "; ".join(
+        f"{r.age} acc {r.acc:.2f} (last heard {r.acc_last_heard:.2f})" for r in t.itertuples()), flush=True)
+    return {k: v.cpu() for k, v in net.state_dict().items()}, F.shape[2]
+
+
+def dest_occupancy(net, z_i, peer_i, i, ch_xy):
+    """Expected share of the other UAVs heading to each charger, as UAV i's world model forecasts it. A record
+    heard this minute is the truth: that UAV's destination is taken as known."""
+    U, K = len(peer_i), len(z_i)
+    others = [j for j in range(U) if j != i]
+    if not others:
+        return np.zeros(K, np.float32)
+    P = peer_i[others]
+    Fe = torch.from_numpy(dest_features(np.broadcast_to(z_i, (len(others),) + z_i.shape), P, ch_xy))
+    with torch.no_grad():
+        p = torch.softmax(net(Fe, torch.ones(Fe.shape[:2], dtype=torch.bool)), 1).numpy()
+    fresh = (P[:, 1] == 0) & (P[:, 0] >= 0)
+    p[fresh] = np.eye(K, dtype=np.float32)[P[fresh, 0].astype(int)]
+    return (p.sum(0) / len(others)).astype(np.float32)
 
 
 def h_stats(m, D):
@@ -286,9 +448,10 @@ def load_memory(path, dev="cpu"):
 # Online world model: V and M running inside the simulator
 # ==============================================================================================
 class OnlineWM:
-    """Builds each UGV's token every --token-every minutes exactly as VAE_test.ch_tokens does from a finished
-    episode, encodes it with the frozen V, and steps the frozen M once per token with the previous token and the
-    docking during the previous 5 minutes (the input M was trained on)."""
+    """Every UAV's own world model, run inside the simulator. Each --token-every minutes it builds, for each UAV
+    and each charger, the token VAE_test.token_grid builds from a finished episode (--knowledge local), encodes it
+    with the frozen V, and steps the frozen M once per (UAV, UGV) with the previous token and the share of the
+    previous 5 minutes that UAV was landed on that UGV (the input M was trained on)."""
 
     def __init__(s, vis, mem=None, mem_meta=None, h_dim=0):
         s.v, s.mem = vis, mem
@@ -307,86 +470,108 @@ class OnlineWM:
 
     def start(s, env, chs, uavs, doy, T, cluster_size, charger_m, n_feat):
         v = s.v
-        s.T, s.U = T, len(uavs)
-        s.ugv = np.array([c for c, ch in enumerate(chs) if not getattr(ch, "is_base", False)])
-        s.Ku = len(s.ugv)
-        s.xy = np.array([(chs[c].id_x, chs[c].id_y) for c in s.ugv], float)
+        s.T, s.U, s.K = T, len(uavs), len(chs)
+        s.is_base = np.array([getattr(ch, "is_base", False) for ch in chs])
+        s.ugv = np.flatnonzero(~s.is_base)
+        s.xy = np.array([(ch.id_x, ch.id_y) for ch in chs], np.float32)
         s.dim = float(env.dim)
         s.sun = np.clip(90.0 - env.sun_zenith, 0.0, 90.0) / 90.0
         s.season = (math.sin(2 * math.pi * doy / 365), math.cos(2 * math.pi * doy / 365))
-        s.size = cluster_size[s.ugv] / 10.0
-        s.to_base = charger_m[s.ugv] / s.dim
+        s.size = (cluster_size / 10.0).astype(np.float32)
+        s.to_base = (charger_m / s.dim).astype(np.float32)
         P = V.node_patches(env, s.xy).astype(np.float64)
         mmu, msd = v["map_stats"]
-        s.zm = ((v["mapc"].enc((P - mmu[0]) / msd[0]) - v["zm_mu"]) / v["zm_sd"]).astype(np.float32)
-        s.obs = np.zeros((T, len(chs), n_feat), np.float32)
-        s.z = np.zeros((s.Ku, v["k_token"]), np.float32)
+        s.zm = ((v["mapc"].enc((P - mmu[0]) / msd[0]) - v["zm_mu"]) / v["zm_sd"]).astype(np.float32)   # (K, k_map)
+        s.obs = np.zeros((T, s.U, s.K, n_feat), np.float32)
+        s.known = np.repeat(s.is_base[None], s.U, 0)         # which chargers' maps each UAV has
+        s.z = np.zeros((s.U, s.K, v["k_token"]), np.float32)
         s.z_prev = None
-        s.h = np.zeros((s.Ku, s.hd), np.float32)
+        s.h = np.zeros((s.U, s.K, s.hd), np.float32)
         if s.mem is not None:
-            s.h = s.h_feat(np.zeros((s.Ku, len(s.h_mu)), np.float32))     # the zero state, transformed
+            s.h[:] = s.h_feat(np.zeros((1, len(s.h_mu)), np.float32))[0]      # the zero state, transformed
         s.state = None
-        s.dock = np.zeros(s.Ku)
+        s.dock = np.zeros((s.U, s.K))
         s.wm_time, s.wm_steps = 0.0, 0
+        s.t_obs = -1
 
-    def token(s, t, uav_xy, alive):
+    def token_now(s, i, t, u):
+        """Fresh token for UAV i deciding during minute t: its knowledge up to the end of minute t - 1 with its
+        current position and battery (V only; M steps on the grid)."""
+        tn = max(min(t - 1, s.t_obs), 0)
+        return s.token(tn, np.array([[u.id_x, u.id_y]], np.float32), np.array([u.state[0][2]], np.float32), [i])[0]
+
+    def token(s, t, uav_xy, uav_soc, rows=None):
+        """Tokens for every UAV (or just rows) from knowledge up to the end of minute t."""
         v = s.v
+        rows = np.arange(s.U) if rows is None else np.asarray(rows)
+        U, K = len(rows), s.K
         frames = np.clip(t - s.lags, 0, s.T - 1)
-        hist = s.obs[frames][:, s.ugv].transpose(1, 0, 2).reshape(s.Ku, -1)
-        tm = np.repeat(np.array([[t / s.T, s.season[0], s.season[1], s.sun[t]]], np.float32), s.Ku, 0)
-        d = np.hypot(*(uav_xy[None, :, :] - s.xy[:, None, :].astype(np.float32)).transpose(2, 0, 1)) / np.float32(s.dim)
-        d = np.where(alive[None, :], d, 2.0).min(1)
-        X = np.concatenate([hist, tm, s.size[:, None].astype(np.float32), d[:, None].astype(np.float32),
-                            s.to_base[:, None].astype(np.float32)], 1).astype(np.float64)
+        hist = s.obs[frames][:, rows].transpose(1, 2, 0, 3).reshape(U, K, -1)
+        tm = np.broadcast_to(np.array([t / s.T, s.season[0], s.season[1], s.sun[t]], np.float32), (U, K, 4))
+        dxy = uav_xy[:, None, :] - s.xy[None, :, :]
+        dist = (np.hypot(dxy[..., 0], dxy[..., 1]) / s.dim).astype(np.float32)
+        batt = np.repeat((uav_soc / 100.0)[:, None], K, 1).astype(np.float32)
+        X = np.concatenate([hist, tm, np.broadcast_to(s.size, (U, K))[..., None], dist[..., None],
+                            np.broadcast_to(s.to_base, (U, K))[..., None], batt[..., None]],
+                           2).astype(np.float64)
         mu, sd = v["ch_stats"]
-        X = np.clip((X - mu) / sd, -v["z_clip"], v["z_clip"])
-        return ((v["tok"].enc(X) - v["zmu"]) / v["zsd"]).astype(np.float32)
+        X = np.clip((X - mu) / sd, -v["z_clip"], v["z_clip"]).reshape(U * K, -1)
+        return ((v["tok"].enc(X) - v["zmu"]) / v["zsd"]).astype(np.float32).reshape(U, K, -1)
 
-    def minute(s, t, obs_t, uav_xy, alive):
-        """End of minute t: record the fleet's observation; on token minutes update h, then z."""
+    def minute(s, t, obs_t, known_t, uav_xy, uav_soc, docked):
+        """End of minute t: record each UAV's knowledge; on token minutes update h, then z. known_t (U, K): the
+        chargers each UAV has heard from (their maps are known); docked (U,): the charger each UAV is landed on."""
         s.obs[t] = obs_t
+        s.t_obs = t
         te = s.v["token_every"]
         if t % te == 0:
             t0 = time.perf_counter()
             if s.z_prev is not None and s.mem is not None:
-                x = np.concatenate([s.z_prev, s.zm, (s.dock / te)[:, None]], 1).astype(np.float32)
+                g = s.ugv
+                zm = np.broadcast_to(s.zm[g], (s.U, len(g), s.zm.shape[1])) * s.known[:, g, None]
+                x = np.concatenate([s.z_prev[:, g], zm, (s.dock[:, g] / te)[..., None]],
+                                   2).reshape(s.U * len(g), -1).astype(np.float32)
                 with torch.no_grad():
                     out = s.mem(torch.from_numpy(x)[:, None, :], s.state)
                 s.state = out[1]
-                s.h = s.h_feat(out[0][:, -1].numpy())
+                s.h[:, g] = s.h_feat(out[0][:, -1].numpy()).reshape(s.U, len(g), -1)
             s.dock[:] = 0.0
-            s.z = s.token(t, uav_xy, alive)
+            s.known = known_t.copy()
+            s.z = s.token(t, uav_xy, uav_soc)
             s.z_prev = s.z
             s.wm_time += time.perf_counter() - t0
             s.wm_steps += 1
-        dd = np.hypot(*(uav_xy[None, :, :] - s.xy[:, None, :]).transpose(2, 0, 1))
-        s.dock += ((dd < s.v["dock_m"]) & alive[None, :]).sum(1)
+        for i, c in enumerate(docked):
+            if c >= 0:
+                s.dock[i, c] += 1.0
 
 
 # ==============================================================================================
 # Controller
 # ==============================================================================================
 class Controller(nn.Module):
-    """Shared per-charger encoder; destination = softmax over chargers; charge | destination; two values."""
+    """Shared per-charger encoder over the world model's output; destination = softmax over chargers;
+    charge | destination; two values. No other input."""
 
     def __init__(s, dc, nC, H=64):
         super().__init__()
         s.enc = nn.Sequential(nn.Linear(dc, 2 * H), nn.Tanh(), nn.Linear(2 * H, H), nn.Tanh())
-        s.ctx = nn.Sequential(nn.Linear(3 + 2 * H, H), nn.Tanh())
+        s.ctx = nn.Sequential(nn.Linear(2 * H, H), nn.Tanh())
         s.dest = nn.Sequential(nn.Linear(2 * H, H), nn.Tanh(), nn.Linear(H, 1))
         s.chg = nn.Sequential(nn.Linear(3 * H, H), nn.Tanh(), nn.Linear(H, nC))
         s.val = nn.Sequential(nn.Linear(H, H), nn.Tanh(), nn.Linear(H, 2))
 
-    def forward(s, F, mask, ctx, here):
-        """F (B, K, dc), mask (B, K) True = allowed, ctx (B, 3), here (B,). Returns dest logits, q, embeddings."""
+    def forward(s, F, mask, here):
+        """F (B, K, dc), mask (B, K) True = allowed destination, here (B,). Rows that are neither allowed nor
+        the current charger are padding."""
         e = s.enc(F)
-        valid = (mask | (torch.arange(F.shape[1], device=F.device)[None] == here[:, None])).float()   # not padding
+        ar = torch.arange(F.shape[1], device=F.device)[None]
+        valid = (mask | (ar == here[:, None])).float()
         pool = (e * valid[..., None]).sum(1) / valid.sum(1, keepdim=True).clamp(min=1.0)
         eh = e[torch.arange(len(F)), here]
-        q = s.ctx(torch.cat([ctx, eh, pool], -1))
+        q = s.ctx(torch.cat([eh, pool], -1))
         logit = s.dest(torch.cat([e, q[:, None].expand_as(e)], -1)).squeeze(-1)
-        logit = logit.masked_fill(~mask, -1e9)
-        return logit, q, e, eh
+        return logit.masked_fill(~mask, -1e9), q, e, eh
 
     def charge_logits(s, q, e, eh, d):
         return s.chg(torch.cat([q, e[torch.arange(len(d)), d], eh], -1))
@@ -397,47 +582,39 @@ class Controller(nn.Module):
 
 class CtrlAgent:
     """VisitPolicy-compatible: the simulator calls act() while a UAV sits at a charger with nothing to sweep.
-    The first call of a visit decides (destination, charge); later calls in that visit return the commitment."""
+    The first call of a visit decides (destination, charge) from this UAV's world model only; later calls in that
+    visit return the commitment."""
 
-    def __init__(s, net, wm, charges, sample, rng):
-        s.net, s.wm, s.charges, s.sample, s.rng = net, wm, charges, sample, rng
+    def __init__(s, net, wm, charges, sample, dest=None):
+        s.net, s.wm, s.charges, s.sample, s.dest = net, wm, charges, sample, dest
         s.uav, s.commit, s.records, s.dec_time = None, {}, [], 0.0
 
-    def start(s, chs, uavs, is_base, t_ref):
-        s.chs, s.uavs, s.is_base, s.t_ref = chs, uavs, is_base, t_ref
+    def start(s, chs, uavs, is_base, t_ref, know):
+        s.chs, s.uavs, s.is_base, s.t_ref, s.know = chs, uavs, is_base, t_ref, know
         s.K = len(chs)
         s.xy = np.array([(c.id_x, c.id_y) for c in chs], float)
-        s.row = {int(c): r for r, c in enumerate(s.wm.ugv)}
 
-    def features(s, u, here):
-        from sim_mods import ablation
-        from sim_mods.ablation import CFG
-        wm = s.wm
-        dz, dm, hd = wm.z.shape[1], wm.zm.shape[1], wm.hd
-        F = np.zeros((s.K, dz + dm + hd + 4), np.float32)
-        soc = float(u.state[0][2])
-        claimed = np.zeros(s.K)
-        for o in s.uavs:
-            if o is not u and not o.crash and o.targetHead is not None:
-                claimed[o.targetHead.cluster_num] += 1
-        for c in range(s.K):
-            if c in s.row:
-                r = s.row[c]
-                F[c, :dz], F[c, dz:dz + dm], F[c, dz + dm:dz + dm + hd] = wm.z[r], wm.zm[r], wm.h[r]
-            else:
-                F[c, dz + dm + hd] = 1.0                            # base station
-            d = math.hypot(s.xy[c, 0] - u.id_x, s.xy[c, 1] - u.id_y)
-            mins = ablation.leg_minutes(d)
-            F[c, -3] = mins / 60.0
-            F[c, -2] = (soc - CFG.tour_margin * ablation.minutes_pct(mins)) / 100.0
-            F[c, -1] = claimed[c] / max(len(s.uavs), 1)
-        F[here, -3:] = 0.0
-        F[here, -2] = soc / 100.0
+    def features(s, i, here):
+        """For every charger, UAV i's world model output: [z, z_map, h, forecast share of the other UAVs heading
+        there]. z is re-encoded from its knowledge now; a charger's map is known once it has heard from it."""
+        wm, t = s.wm, s.t_ref[0]
+        z = wm.token_now(i, t, s.uavs[i])
+        known = (s.know.ref[i] > -10_000.0) | s.is_base
+        occ = dest_occupancy(s.dest, z, s.know.peers(t)[i], i, s.xy / wm.dim)
+        F = np.concatenate([z, wm.zm * known[:, None], wm.h[i], occ[:, None]], 1).astype(np.float32)
         mask = np.ones(s.K, bool)
         mask[here] = False
-        t = s.t_ref[0]
-        ctx = np.array([soc / 100.0, t / wm.T, wm.sun[min(t, wm.T - 1)]], np.float32)
-        return F, mask, ctx
+        return F, mask
+
+    def decide(s, F, mask, here):
+        with torch.no_grad():
+            logit, q, e, eh = s.net(torch.from_numpy(F)[None], torch.from_numpy(mask)[None], torch.tensor([here]))
+            pd_ = torch.distributions.Categorical(logits=logit[0])
+            d = int(pd_.sample()) if s.sample else int(logit[0].argmax())
+            cl = s.net.charge_logits(q, e, eh, torch.tensor([d]))[0]
+            pc = torch.distributions.Categorical(logits=cl)
+            c = int(pc.sample()) if s.sample else int(cl.argmax())
+            return d, c, float(pd_.log_prob(torch.tensor(d))), float(pc.log_prob(torch.tensor(c))), s.net.value(q)[0].numpy()
 
     def act(s, state):
         u = s.uav
@@ -446,67 +623,61 @@ class CtrlAgent:
         if com is not None and com["here"] is u.target:
             return com["dest"]
         t0 = time.perf_counter()
-        F, mask, ctx = s.features(u, here)
+        i = s.uavs.index(u)
+        F, mask = s.features(i, here)
         if not mask.any():
             return here
-        with torch.no_grad():
-            Ft, mt, ct, ht = (torch.from_numpy(F)[None], torch.from_numpy(mask)[None], torch.from_numpy(ctx)[None],
-                              torch.tensor([here]))
-            logit, q, e, eh = s.net(Ft, mt, ct, ht)
-            pd_ = torch.distributions.Categorical(logits=logit[0])
-            d = int(pd_.sample()) if s.sample else int(logit[0].argmax())
-            cl = s.net.charge_logits(q, e, eh, torch.tensor([d]))[0]
-            pc = torch.distributions.Categorical(logits=cl)
-            c = int(pc.sample()) if s.sample else int(cl.argmax())
-            v = s.net.value(q)[0].numpy()
-            lpd, lpc = float(pd_.log_prob(torch.tensor(d))), float(pc.log_prob(torch.tensor(c)))
+        d, c, lpd, lpc, v = s.decide(F, mask, here)
         s.dec_time += time.perf_counter() - t0
-        return s.commit_to(u, here, F, mask, ctx, d, c, lpd, lpc, v)
+        return s.commit_to(u, i, here, F, mask, d, c, lpd, lpc, v)
 
-    def commit_to(s, u, here, F, mask, ctx, d, c, lpd, lpc, v):
+    def commit_to(s, u, i, here, F, mask, d, c, lpd, lpc, v):
         minutes = s.charges[c]
         if minutes > 0:
             u.is_charging = True
             u.p_count = max(u.p_count, minutes + 1)     # set_dest takes one off before the exit check
         s.commit[id(u)] = dict(here=u.target, dest=d)
-        s.records.append(dict(F=F, mask=mask, ctx=ctx, here=here, d=d, c=c, lpd=lpd, lpc=lpc, v=v, t=s.t_ref[0],
-                              uav=s.uavs.index(u), minutes=minutes))
+        s.know.announce(i, d, s.t_ref[0])
+        s.records.append(dict(F=F, mask=mask, here=here, d=d, c=c, lpd=lpd, lpc=lpc, v=v, t=s.t_ref[0], uav=i,
+                              minutes=minutes))
         return d
 
 
 class TeacherAgent(CtrlAgent):
-    """Warm-start teacher, acting through the controller's interface (same features, same commitment).
-    Destination: greedy on the FLEET's view (each charger's freshest peak AoI over the UAVs, which the token
-    carries) minus flight minutes, skipping chargers another UAV is heading to. The greedy baseline scores the
-    deciding UAV's own AoI record instead, which nothing the controller sees contains, so it cannot be imitated.
-    Charge: the shortest option that leaves at least --teacher-soc % after the leg there (10 %/min below 80 %),
-    none at a UGV at or below 20 %."""
+    """Warm-start teacher acting through the controller's interface (same features recorded, same commitment),
+    deciding from the same UAV-local knowledge uncompressed: destination = greedy on this UAV's own estimate of
+    each charger's peak AoI minus the flight minutes, skipping chargers its world model forecasts another UAV is
+    heading to; charge when the leg there would leave less than
+    --teacher-soc %, unless the UAV's own reading of this UGV is at or below 20 %."""
 
-    def __init__(s, wm, charges, teacher_soc):
-        super().__init__(None, wm, charges, False, None)
+    def __init__(s, wm, charges, teacher_soc, dest):
+        super().__init__(None, wm, charges, False, dest)
         s.teacher_soc = teacher_soc
 
     def act(s, state):
+        from sim_mods import ablation
+        from sim_mods.ablation import CFG
         u = s.uav
         here = u.target.cluster_num
         com = s.commit.get(id(u))
         if com is not None and com["here"] is u.target:
             return com["dest"]
-        F, mask, ctx = s.features(u, here)
+        i = s.uavs.index(u)
+        F, mask = s.features(i, here)
         if not mask.any():
             return here
-        t = max(s.t_ref[0] - 1, 0)
-        score = s.wm.obs[t, :, 3] * s.wm.T - 60.0 * F[:, -3]        # fleet peak AoI - flight minutes
-        ok = mask & (F[:, -1] == 0)
-        if not ok.any():
-            ok = mask
-        d = int(np.flatnonzero(ok)[np.argmax(score[ok])])
-        need = s.teacher_soc - 100.0 * F[d, -2]
-        ugv_low = not s.is_base[here] and s.chs[here].perceived_soc <= 20.0
-        mins = 0 if need <= 0 or ugv_low else math.ceil(need / 10.0)
-        opts = [k for k, m in enumerate(s.charges) if m >= mins]
-        c = opts[0] if opts else len(s.charges) - 1
-        return s.commit_to(u, here, F, mask, ctx, d, c, 0.0, 0.0, np.zeros(2))
+        mins = np.array([ablation.leg_minutes(math.hypot(s.xy[c, 0] - u.id_x, s.xy[c, 1] - u.id_y)) for c in range(s.K)])
+        free = mask & (F[:, -1] * (len(s.uavs) - 1) < 0.5)    # skip chargers it forecasts others heading to
+        score = np.where(free if free.any() else mask, s.know.estP[i] - mins, -np.inf)
+        d = int(np.argmax(score))
+        after = u.state[0][2] - CFG.tour_margin * ablation.minutes_pct(mins[d])
+        low = not s.is_base[here] and u.known_charge(s.chs[here]) <= 20.0
+        need = after < s.teacher_soc and not low
+        c = len(s.charges) - 1 if need else 0
+        if need and len(s.charges) > 2:                   # duration mode: shortest option that is enough
+            want = math.ceil((s.teacher_soc - after) / 10.0)
+            c = next((k for k, m in enumerate(s.charges) if m >= want), len(s.charges) - 1)
+        return s.commit_to(u, i, here, F, mask, d, c, 0.0, 0.0, np.zeros(2))
 
 
 class BaselineAgent:
@@ -537,7 +708,6 @@ def run_world(world_seed, b, agent, wm=None):
     from sim_mods.ablation import CFG
     env, info = V.build_world(world_seed, b)
     CFG.charging = "external" if isinstance(agent, CtrlAgent) else "dynamic"
-    CFG.supply_margin = getattr(b, "supply_margin", 0.0)
     ep_rng = np.random.default_rng(world_seed + 1)
     random.seed(world_seed)
     np.random.seed(world_seed % (2 ** 32))
@@ -569,10 +739,11 @@ def run_world(world_seed, b, agent, wm=None):
     cluster_size = np.bincount(cluster, minlength=K).astype(np.float32)
     charger_m = np.array([getattr(ch, "charger_m", 0.0) for ch in chs], np.float32)
     t_ref = [0]
+    know = V.UAVKnowledge(env, chs, uavs, T, b.uav_alt, b.plora_m, b.intent_min)   # what each UAV knows (as collected)
     if wm is not None:
         wm.start(env, chs, uavs, info["doy"], T, cluster_size, charger_m, len(V.CH_FEATS))
     if isinstance(agent, CtrlAgent):
-        agent.start(chs, uavs, is_base, t_ref)
+        agent.start(chs, uavs, is_base, t_ref, know)
     else:
         agent.make(chs, uavs, ep_rng)
     power = V.NullPower()
@@ -659,8 +830,12 @@ def run_world(world_seed, b, agent, wm=None):
         r_chg[:, t] = np.where(dead, 0.0, 0.25 * r_peak + 0.25 * r_avg + 0.5 * r_chg[:, t])
         d_aoi[:, t] = np.where(dead, 0.0, d_chg)
         peak_t[t], avg_t[t] = peaks.max(), avgs.mean()
+        know.update(t, dead, age)                    # same place in the minute as VAE_test.run_episode
         if wm is not None:
-            wm.minute(t, obs, np.array([(u.id_x, u.id_y) for u in uavs], np.float32), ~dead)
+            soc = np.array([0.0 if dead[i] else u.state[0][2] for i, u in enumerate(uavs)], np.float32)
+            dk = np.array([u.target.cluster_num if (not dead[i] and u.target is not None and u.target.type == 2
+                                                    and u.h == 0) else -1 for i, u in enumerate(uavs)])
+            wm.minute(t, know.obs(t), (know.ref > -10_000.0) | is_base[None], np.array([(u.id_x, u.id_y) for u in uavs], np.float32), soc, dk)
     n_dec = len(agent.records) if isinstance(agent, CtrlAgent) else 0
     met = dict(r_tgt=r_tgt.mean(), r_chg=r_chg.mean(), peak_aoi=peak_t.mean(), avg_aoi=avg_t.mean(),
                data_mb=sum(u.state[0][1] for u in uavs) / 1e6, deaths=int(dead.sum()),
@@ -686,7 +861,11 @@ def _init_worker(ctrl_out, mem, seed, charging, b, hidden, h_dim=0):
     vis = pickle.load(open(os.path.join(ctrl_out, "models", "vision.pkl"), "rb"))
     m, meta = (None, None) if mem == "none" else load_memory(os.path.join(ctrl_out, "models", f"mem_{mem}_s{seed}.pt"))
     _W["wm"] = OnlineWM(vis, m, meta, h_dim)
-    dc = vis["k_token"] + vis["k_map"] + _W["wm"].hd + 4
+    dc = vis["k_token"] + vis["k_map"] + _W["wm"].hd + 1
+    dd = torch.load(os.path.join(ctrl_out, "models", "dest.pt"), weights_only=False)
+    _W["dest"] = DestNet(dd["f"])
+    _W["dest"].load_state_dict(dd["state"])
+    _W["dest"].eval()
     _W["net"] = Controller(dc, len(_W["charges"]), hidden)
     _W["net"].eval()
 
@@ -698,11 +877,11 @@ def _rollout(job):
     with contextlib.redirect_stdout(io.StringIO()):            # the simulator prints
         if kind == "ctrl":
             _W["net"].load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            agent = CtrlAgent(_W["net"], _W["wm"], _W["charges"], sample, np.random.default_rng(world))
+            agent = CtrlAgent(_W["net"], _W["wm"], _W["charges"], sample, _W["dest"])
             torch.manual_seed(world)
             out = run_world(world, _W["b"], agent, _W["wm"])
         elif kind == "teacher":                                # weights = --teacher-soc here
-            out = run_world(world, _W["b"], TeacherAgent(_W["wm"], _W["charges"], weights), _W["wm"])
+            out = run_world(world, _W["b"], TeacherAgent(_W["wm"], _W["charges"], weights, _W["dest"]), _W["wm"])
         else:
             out = run_world(world, _W["b"], BaselineAgent(kind))
     out["world"] = world
@@ -761,7 +940,7 @@ def batch_tensors(rows, dev):
         k = len(r["mask"])
         F[i, :k], Mk[i, :k] = r["F"], r["mask"]
     st = lambda key, dt=np.float32: torch.tensor(np.array([r[key] for r in rows], dt), device=dev)
-    return dict(F=torch.tensor(F, device=dev), mask=torch.tensor(Mk, device=dev), ctx=st("ctx"), here=st("here", np.int64),
+    return dict(F=torch.tensor(F, device=dev), mask=torch.tensor(Mk, device=dev), here=st("here", np.int64),
                 d=st("d", np.int64), c=st("c", np.int64), lpd=st("lpd"), lpc=st("lpc"), adv=st("adv"), ret=st("ret"))
 
 
@@ -773,7 +952,7 @@ def ppo_update(net, opt, rows, a, dev):
     stats = []
     for _ in range(a.ppo_epochs):
         for idx in torch.randperm(n, device=dev).split(a.minibatch):
-            logit, q, e, eh = net(B["F"][idx], B["mask"][idx], B["ctx"][idx], B["here"][idx])
+            logit, q, e, eh = net(B["F"][idx], B["mask"][idx], B["here"][idx])
             pd_ = torch.distributions.Categorical(logits=logit)
             cl = net.charge_logits(q, e, eh, B["d"][idx])
             pc = torch.distributions.Categorical(logits=cl)
@@ -803,7 +982,7 @@ def warm_start(net, a, ex, seed, dev, tag):
     net.train()
     for _ in range(a.bc_epochs):
         for idx in torch.randperm(len(rows), device=dev).split(a.minibatch):
-            logit, q, e, eh = net(B["F"][idx], B["mask"][idx], B["ctx"][idx], B["here"][idx])
+            logit, q, e, eh = net(B["F"][idx], B["mask"][idx], B["here"][idx])
             cl = net.charge_logits(q, e, eh, B["d"][idx])
             loss = ce(logit, B["d"][idx]) + ce(cl, B["c"][idx]) + a.vcoef * ((net.value(q) - B["ret"][idx]) ** 2).mean()
             opt.zero_grad()
@@ -812,7 +991,7 @@ def warm_start(net, a, ex, seed, dev, tag):
             opt.step()
     net.eval()
     with torch.no_grad():
-        logit, q, e, eh = net(B["F"], B["mask"], B["ctx"], B["here"])
+        logit, q, e, eh = net(B["F"], B["mask"], B["here"])
         acc_d = (logit.argmax(1) == B["d"]).float().mean().item()
         acc_c = (net.charge_logits(q, e, eh, B["d"]).argmax(1) == B["c"]).float().mean().item()
     m = pd.DataFrame([ep["metrics"] for ep in eps]).mean(numeric_only=True)
@@ -836,7 +1015,7 @@ def train_one(a, b, mem, charging, seed):
     torch.manual_seed(seed)
     vis = pickle.load(open(os.path.join(a.ctrl_out, "models", "vision.pkl"), "rb"))
     hd = h_width(a, mem, seed)
-    net = Controller(vis["k_token"] + vis["k_map"] + hd + 4, len(CHARGE_SETS[charging]), a.ctrl_hidden).to(dev)
+    net = Controller(vis["k_token"] + vis["k_map"] + hd + 1, len(CHARGE_SETS[charging]), a.ctrl_hidden).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     done = 0
     if os.path.exists(ckpt):
@@ -846,32 +1025,55 @@ def train_one(a, b, mem, charging, seed):
         done = c["episodes"]
         print(f"train {tag}: resuming after {done} episodes", flush=True)
     log = os.path.join(a.ctrl_out, "ctrl_train.csv")
+    vworlds = [VAL_WORLD_BASE + i for i in range(a.val_worlds)]
+    weights = lambda: {k: v.detach().cpu().numpy() for k, v in net.state_dict().items()}
+
+    def validate(ex):
+        outs = list(ex.map(_rollout, [(wd, weights(), False, "ctrl") for wd in vworlds]))
+        return float(np.mean([o["metrics"]["r_tgt"] for o in outs]))
+
+    best = dict(score=-np.inf, net=None, episodes=-1)
+    if os.path.exists(ckpt):
+        best = c.get("best", best)
     with pool(a, mem, seed, charging, b) as ex:
         if a.warm_start == "greedy" and not os.path.exists(ckpt):
             warm_start(net, a, ex, seed, dev, tag)
-            torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), episodes=0), ckpt)
+            score = validate(ex)
+            best = dict(score=score, net=weights(), episodes=0)
+            L.append(log, dict(arm=mem, charging=charging, seed=seed, episodes=0, val_r_tgt=score, best=True))
+            print(f"train {tag}: warm start validation r_tgt {score:.3f}", flush=True)
+            torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), episodes=0, best=best), ckpt)
         while done < a.train_episodes:
             t0 = time.time()
             n = min(a.episodes_per_iter, a.train_episodes - done)
-            w = {k: v.detach().cpu().numpy() for k, v in net.state_dict().items()}
             worlds = [TRAIN_WORLD_BASE + seed * 100_000 + done + i for i in range(n)]
-            eps = list(ex.map(_rollout, [(wd, w, True, "ctrl") for wd in worlds]))
+            eps = list(ex.map(_rollout, [(wd, weights(), True, "ctrl") for wd in worlds]))
             rows = [r for ep in eps for r in advantages(ep, a)]
             net.train()
             vl, hd_, hc = ppo_update(net, opt, rows, a, dev) if rows else (np.nan,) * 3
             net.eval()
-            done += n
+            prev, done = done, done + n
             m = pd.DataFrame([ep["metrics"] for ep in eps]).mean(numeric_only=True)
             row = dict(arm=mem, charging=charging, seed=seed, episodes=done, decisions=len(rows), value_loss=vl,
                        ent_dest=hd_, ent_charge=hc, seconds=time.time() - t0,
                        **{k: m[k] for k in ("r_tgt", "r_chg", "peak_aoi", "deaths", "diversions", "charge_min")})
+            note = ""
+            if done // a.val_every > prev // a.val_every or done >= a.train_episodes:
+                score = validate(ex)
+                row.update(val_r_tgt=score, best=score > best["score"])
+                if score > best["score"]:
+                    best = dict(score=score, net=weights(), episodes=done)
+                note = f"  validation {score:.3f} (best {best['score']:.3f} at {best['episodes']})"
             L.append(log, row)
             print(f"train {tag}: {done}/{a.train_episodes} episodes  r_tgt {m['r_tgt']:.3f}  r_chg {m['r_chg']:.3f}  "
                   f"peak AoI {m['peak_aoi']:.0f}  deaths {m['deaths']:.2f}  charge {m['charge_min']:.1f} min  "
-                  f"({time.time() - t0:.0f}s)", flush=True)
-            torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), episodes=done), ckpt)
-    torch.save(dict(net={k: v.cpu() for k, v in net.state_dict().items()}, mem=mem, charging=charging, seed=seed,
-                    hidden=a.ctrl_hidden), final)
+                  f"({time.time() - t0:.0f}s){note}", flush=True)
+            torch.save(dict(net=net.state_dict(), opt=opt.state_dict(), episodes=done, best=best), ckpt)
+    keep = best["net"] if best["net"] is not None else weights()
+    torch.save(dict(net={k: torch.as_tensor(v) for k, v in keep.items()}, mem=mem, charging=charging, seed=seed,
+                    hidden=a.ctrl_hidden, best_episodes=best["episodes"], val_r_tgt=best["score"]), final)
+    print(f"train {tag}: kept the policy from episode {best['episodes']} (validation r_tgt {best['score']:.3f})",
+          flush=True)
     os.remove(ckpt)
 
 
@@ -929,7 +1131,7 @@ def cmd_eval(a, b):
             if not os.path.exists(f):
                 print(f"eval: no trained controller {arm_tag(mem, charging, seed)}; skipped", flush=True)
                 continue
-            w = {k: v.numpy() for k, v in torch.load(f, weights_only=False)["net"].items()}
+            w = {k: v.cpu().numpy() for k, v in torch.load(f, weights_only=False)["net"].items()}
             with pool(a, mem, seed, charging, b) as ex:
                 outs = list(ex.map(_rollout, [(wd, w, False, "ctrl") for wd in todo]))
         for o in outs:

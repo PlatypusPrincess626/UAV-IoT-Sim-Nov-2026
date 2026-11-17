@@ -242,6 +242,8 @@ def build_world(ep_seed, a):
     CFG.charging, CFG.sensor_sweep, CFG.decision_state = "dynamic", a.sweep, "raw"
     CFG.charger_divert, CFG.tour_fresh_min = a.charger_divert, a.tour_fresh_min
     CFG.sortie_credit = getattr(a, "sortie_credit", None) or "gated"
+    CFG.local_knowledge = getattr(a, "knowledge", "fleet") == "local"
+    CFG.supply_margin = getattr(a, "supply_margin", 0.0)
     # K-means picks K in [max(--min-ch, number of UAVs), --max-ch]: at least one CH per UAV
     ch_range = None if a.num_ch is not None or a.ch_select != "silhouette" else (max(a.min_ch, a.uavs), a.max_ch)
     auto = a.num_ch is None and a.ch_select == "coverage"
@@ -295,6 +297,12 @@ def run_episode(env, info, kind, ep_seed, a):
     policy = VisitPolicy(kind, chs, uavs, ep_rng, ablation.UAV_SPEED)
     power = NullPower()
     sun_elev = np.clip(90.0 - env.sun_zenith, 0.0, 90.0) / 90.0
+    know = UAVKnowledge(env, chs, uavs, T, a.uav_alt, a.plora_m, a.intent_min)
+    uv_obs = np.zeros((T, U, K, len(CH_FEATS)), np.float32)
+    uv_peer = np.zeros((T, U, U, 5), np.float32)
+    uav_dest = np.full((T, U), -1, np.int16)        # where each UAV is actually heading (destination predictor)
+    uav_soc = np.zeros((T, U), np.float32)
+    uav_docked = np.full((T, U), -1, np.int16)      # charger a UAV is landed on (-1 = none)
 
     last_contact = np.full(K, -10_000.0)
     last_short = np.full(K, -10_000.0)
@@ -351,6 +359,14 @@ def run_episode(env, info, kind, ep_seed, a):
         # A UAV ages its AoI table only inside its own receive_data, so a dead UAV's table freezes.
         # The fleet's knowledge from it keeps ageing: add the minutes since it died.
         age = np.where(dead, t - died_at, 0.0)
+        know.update(t, dead, age)
+        uv_obs[t] = know.obs(t)
+        uv_peer[t] = know.peers(t)
+        uav_dest[t] = [u.targetHead.cluster_num if (not dead[i] and u.targetHead is not None) else -1
+                       for i, u in enumerate(uavs)]
+        uav_soc[t] = [0.0 if dead[i] else u.state[0][2] for i, u in enumerate(uavs)]
+        uav_docked[t] = [u.target.cluster_num if (not dead[i] and u.target is not None and u.target.type == 2
+                                                   and u.h == 0) else -1 for i, u in enumerate(uavs)]
         for c in range(K):
             peak = min(u.state[c + 1][2] + age[i] for i, u in enumerate(uavs))
             avg = min(u.state[c + 1][3] + age[i] for i, u in enumerate(uavs))
@@ -368,8 +384,147 @@ def run_episode(env, info, kind, ep_seed, a):
                 charger_m=np.array([getattr(ch, "charger_m", 0.0) for ch in chs], np.float32),
                 cluster_size=np.bincount(cluster, minlength=K).astype(np.float32),
                 uav_xy=uav_xy, uav_alive=uav_alive, uav_died_docked=died_docked, is_base=is_base,
+                uv_obs=uv_obs, uv_peer=uv_peer, uav_dest=uav_dest, uav_soc=uav_soc, uav_docked=uav_docked, air_links=np.int32(know.links),
                 ch_out_any=ch_out[:, ~is_base].any(0), sens_out_any=sens_out.any(0),
                 dim=np.float32(env.dim))
+
+
+PLORA_M = 5_000.0             # default PLoRa / LoRa maximum distance (devices_iot / devices_uav comms specs)
+
+
+def air_los(env, ax, ay, bx, by, alt):
+    """Line of sight between two UAVs flying alt metres above the ground (terrain only: they fly above the
+    canopy), sampled every 4 map cells."""
+    length = math.hypot(bx - ax, by - ay)
+    t = np.linspace(0.0, 1.0, max(2, int(length / (4 * env.map_res)) + 1))
+    cx = np.clip(((ax + t * (bx - ax)) // env.map_res).astype(int), 0, env.map_cells - 1) + env.pad_cells
+    cy = np.clip(((ay + t * (by - ay)) // env.map_res).astype(int), 0, env.map_cells - 1) + env.pad_cells
+    ground = env.topo_mask[cy, cx]
+    line = ground[0] + alt + t * (ground[-1] - ground[0])
+    return not bool((ground[1:-1] > line[1:-1]).any())
+
+
+class UAVKnowledge:
+    """
+    What each UAV knows about each charger, for --knowledge local. A UAV learns about a charger only
+      * from its own contact (in range of it: the charger reports its battery; uploads reset its AoI),
+      * from its own charging there (a charge shortfall), and
+      * from another UAV, when both are airborne within PLoRa range (5 km) with line of sight
+        (--uav-alt above the terrain): they swap their newest records (gossip, so relayed records travel on).
+    obs(t) gives, per (UAV, charger), the six CH_FEATS from that UAV's knowledge alone:
+      tel_soc        charger battery at the newest reading it has (prior 50 %, base station 100 %)
+      since_contact  minutes since that reading (own or relayed)
+      since_shortfall minutes since a shortfall it experienced or heard of
+      peak_aoi / avg_aoi  its own AoI record, or a fresher relayed estimate (both age by a minute a minute)
+      data_share     its own data from that charger / its own total
+    Each UAV also keeps a record of every other UAV: the destination it last heard, that UAV's position and
+    battery then, and when (records travel with the swaps; a UAV that has just chosen a destination tells the
+    UAVs it is linked with at once). At take-off every UAV is known to be at the base. peers(t) gives these
+    records; the world model's destination predictor (Ctrl_test.py) turns them into a forecast of where each
+    other UAV is heading. heading(t) counts the destinations heard within --intent-min minutes.
+    The world model's token also gets the UAV's own battery and its distance to the charger.
+    """
+
+    def __init__(s, env, chs, uavs, T, alt, reach=PLORA_M, intent_min=30.0):
+        s.env, s.chs, s.uavs, s.T, s.alt, s.reach, s.intent_min = env, chs, uavs, T, alt, reach, intent_min
+        U, K = len(uavs), len(chs)
+        s.base = np.array([getattr(c, "is_base", False) for c in chs])
+        s.ref = np.full((U, K), -10_000.0)
+        s.soc = np.where(s.base[None, :], 100.0, 50.0).repeat(U, 0).astype(float)
+        s.short = np.full((U, K), -10_000.0)
+        s.rel_peak = np.full((U, K), np.inf)
+        s.rel_avg = np.full((U, K), np.inf)
+        s.short_seen = np.zeros(U)
+        s.intent = np.full((U, U), -1)             # intent[i, j]: charger UAV i last heard UAV j is heading to
+        s.intent_t = np.zeros((U, U))              # when (take-off: everyone is known to be at the base)
+        s.kpos = np.repeat(np.array([[u.id_x, u.id_y] for u in uavs], float)[None], U, 0)   # j's position then
+        s.kbatt = np.full((U, U), np.nan)          # j's battery then (unknown until heard)
+        s.adj = np.zeros((U, U), bool)            # PLoRa links in the last minute
+        s.links = 0
+
+    def own_aoi(s, age):
+        P = np.array([[u.state[c + 1][2] for c in range(len(s.chs))] for u in s.uavs], float) + age[:, None]
+        A = np.array([[u.state[c + 1][3] for c in range(len(s.chs))] for u in s.uavs], float) + age[:, None]
+        return P, A
+
+    def update(s, t, dead, age):
+        """After the UAVs moved, uploaded and charged in minute t."""
+        s.rel_peak += 1.0
+        s.rel_avg += 1.0
+        for i, u in enumerate(s.uavs):
+            if dead[i]:
+                continue
+            tg = u.target
+            if tg is not None and tg.type == 2 and u.inRange:
+                c = tg.cluster_num
+                s.ref[i, c] = t
+                s.soc[i, c] = 100.0 if s.base[c] else tg.stored_energy
+            if u.short_minutes > s.short_seen[i] and tg is not None and tg.type == 2:
+                s.short[i, tg.cluster_num] = t
+            s.short_seen[i] = u.short_minutes
+            s.intent[i, i] = u.targetHead.cluster_num if u.targetHead is not None else -1
+            s.intent_t[i, i] = t
+            s.kpos[i, i] = (u.id_x, u.id_y)
+            s.kbatt[i, i] = u.state[0][2]
+        P, A = s.own_aoi(age)
+        estP, estA = np.minimum(P, s.rel_peak), np.minimum(A, s.rel_avg)
+        air = [i for i, u in enumerate(s.uavs) if not dead[i] and u.h == 1]
+        s.adj[:] = False
+        for x, i in enumerate(air):
+            for j in air[x + 1:]:
+                ui, uj = s.uavs[i], s.uavs[j]
+                if math.hypot(ui.id_x - uj.id_x, ui.id_y - uj.id_y) > s.reach:
+                    continue
+                if not air_los(s.env, ui.id_x, ui.id_y, uj.id_x, uj.id_y, s.alt):
+                    continue
+                s.links += 1
+                s.adj[i, j] = s.adj[j, i] = True
+                newer = s.ref[j] > s.ref[i]
+                s.soc[i, newer], s.ref[i, newer] = s.soc[j, newer], s.ref[j, newer]
+                s.soc[j, ~newer], s.ref[j, ~newer] = s.soc[i, ~newer], s.ref[i, ~newer]
+                s.short[i] = s.short[j] = np.maximum(s.short[i], s.short[j])
+                nw = s.intent_t[j] > s.intent_t[i]
+                for arr in (s.intent, s.intent_t, s.kpos, s.kbatt):
+                    arr[i, nw] = arr[j, nw]
+                    arr[j, ~nw] = arr[i, ~nw]
+                s.rel_peak[i] = s.rel_peak[j] = estP[i] = estP[j] = np.minimum(estP[i], estP[j])
+                s.rel_avg[i] = s.rel_avg[j] = estA[i] = estA[j] = np.minimum(estA[i], estA[j])
+        for i, u in enumerate(s.uavs):                       # the shield's charger readings (CFG.local_knowledge)
+            u.known_soc = {c: s.soc[i, c] for c in range(len(s.chs)) if s.ref[i, c] > -10_000.0}
+        s.estP, s.estA = estP, estA
+
+    def announce(s, i, c, t):
+        """UAV i has just chosen charger c: it knows at once, and so does every UAV it is linked with."""
+        u = s.uavs[i]
+        for j in [i] + list(np.flatnonzero(s.adj[i])):
+            s.intent[j, i], s.intent_t[j, i] = c, t
+            s.kpos[j, i] = (u.id_x, u.id_y)
+            s.kbatt[j, i] = u.state[0][2]
+
+    def peers(s, t):
+        """(U, U, 5): what UAV i knows of UAV j: [destination heard (-1 none), minutes since / T,
+        position then x / dim, y / dim, battery then / 100 (0.5 if never heard)]."""
+        dim = float(s.env.dim)
+        return np.stack([s.intent.astype(np.float32), np.minimum(t - s.intent_t, s.T) / s.T, s.kpos[..., 0] / dim,
+                         s.kpos[..., 1] / dim, np.nan_to_num(s.kbatt / 100.0, nan=0.5)], 2).astype(np.float32)
+
+    def heading(s, t):
+        """(U, K): share of the other UAVs this UAV knows (within --intent-min) to be heading to each charger."""
+        U, K = len(s.uavs), len(s.chs)
+        out = np.zeros((U, K), np.float32)
+        for i in range(U):
+            for j in range(U):
+                if j != i and s.intent[i, j] >= 0 and t - s.intent_t[i, j] <= s.intent_min:
+                    out[i, s.intent[i, j]] += 1.0
+        return out / max(U - 1, 1)
+
+    def obs(s, t):
+        """(U, K, 6) features, after update(t)."""
+        T = s.T
+        own = np.array([[u.state[c + 1][1] for c in range(len(s.chs))] for u in s.uavs], float)
+        tot = np.maximum(np.array([u.state[0][1] for u in s.uavs], float), 1.0)
+        return np.stack([s.soc / 100.0, np.minimum(t - s.ref, T) / T, np.minimum(t - s.short, T) / T,
+                         np.minimum(s.estP, T) / T, np.minimum(s.estA, T) / T, own / tot[:, None]], 2).astype(np.float32)
 
 
 def node_patches(env, pts):
@@ -441,10 +596,13 @@ def collect_one(job):
 WORLD_KEYS = ("area_km2", "sensors", "uavs", "num_ch", "ch_select", "min_ch", "max_ch", "depart_charge",
               "uav_reserve", "flight_margin", "val_frac", "test_frac", "terrain", "policy_cycle", "ch_start_soc",
               "sensor_start_soc", "uav_start_soc", "layout", "field_m", "woodlot_frac", "hedgerow_m",
-              "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "sortie_credit", "bs_exclusion_m",
+              "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "sortie_credit", "knowledge", "uav_alt", "plora_m", "intent_min", "supply_margin", "bs_exclusion_m",
               "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base")
 RUN_KEYS = ("n_episodes", "val_frac", "test_frac", "history", "history_stride", "token_every", "z_clip", "max_train", "max_eval",
             "max_probe", "max_epochs", "patience", "batch", "lr", "beta", "kl_tol")
+
+
+LEGACY = {"knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0}   # what a folder made before these settings existed used
 
 
 def check_config(path, a, keys, what):
@@ -453,6 +611,7 @@ def check_config(path, a, keys, what):
     cfg = {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(a).items() if k in keys}
     if os.path.exists(path):
         old = json.load(open(path))
+        old = {**{k: v for k, v in LEGACY.items() if k not in old}, **old}   # settings added after a folder was made
         diff = {k: (old.get(k), cfg[k]) for k in cfg if old.get(k) != cfg[k]}
         if diff:
             raise SystemExit(f"{what} in {os.path.dirname(path) or '.'} were made with different settings "
@@ -499,31 +658,73 @@ def split_episodes(files, a):
     return parts["train"], parts["val"], parts["test"]
 
 
-def ch_tokens(d, a, rng, cap):
-    """Tokens (N, D) and targets (N, 3) for one episode; steps subsampled every --token-every minutes."""
-    if "is_base" in d and d["is_base"].any():         # base station: no hidden state, not compressed
-        keep = ~d["is_base"]
-        d = dict(d, ch_obs=d["ch_obs"][:, keep], ch_xy=d["ch_xy"][keep], cluster_size=d["cluster_size"][keep],
-                 ch_soc=d["ch_soc"][:, keep], ch_out=d["ch_out"][:, keep], ch_out_60=d["ch_out_60"][:, keep],
-                 sens_frac=d["sens_frac"][:, keep], charger_m=d["charger_m"][keep])
-    T, K, F = d["ch_obs"].shape
+def token_names(a):
+    """Names of the token's columns, in order (pca_feature_kept.csv)."""
+    names = [f"{f}@-{l * a.history_stride}m".replace("@-0m", "@now") for l in range(a.history) for f in CH_FEATS]
+    names += ["day_phase", "doy_sin", "doy_cos", "sun_elev", "cluster_size"]
+    if getattr(a, "knowledge", "fleet") == "local":
+        return names + ["uav_dist", "base_dist", "uav_battery"]
+    return names + ["nearest_uav_dist", "base_dist"]
+
+
+def token_grid(d, a, include_base=False):
+    """
+    Tokens on a (step, row) grid, every --token-every minutes. Base stations have no hidden state and are
+    not compressed. --knowledge fleet: one row per UGV, from the fleet's shared view (ch_obs).
+    --knowledge local: one row per (UAV, UGV), from that UAV's own knowledge (uv_obs), with its own battery
+    and its distance to the UGV; rows ordered UAV-major. include_base: base-station rows too (their hidden truth
+    is meaningless; the destination predictor uses them). Returns X (n, R, D), Y (n, R, 4) (the UGV's hidden
+    truth: charge, out within 60 min, sensor-outage share, out now), alive (n, R), ugv (R,) charger index,
+    uav (R,) UAV index (-1 in fleet mode).
+    """
+    keep = ~d["is_base"] if "is_base" in d else np.ones(d["ch_obs"].shape[1], bool)
+    if include_base:
+        keep = np.ones_like(keep)
+    ugv_idx = np.flatnonzero(keep)
+    T = d["ch_obs"].shape[0]
     steps = np.arange(0, T, a.token_every)
+    n = len(steps)
     lags = np.arange(a.history) * a.history_stride
-    frames = np.clip(steps[:, None] - lags[None, :], 0, T - 1)              # (n_steps, H)
-    hist = d["ch_obs"][frames]                                              # (n_steps, H, K, F)
-    hist = hist.transpose(0, 2, 1, 3).reshape(len(steps), K, a.history * F)
-    tm = np.repeat(d["time"][steps][:, None, :], K, 1)
+    frames = np.clip(steps[:, None] - lags[None, :], 0, T - 1)              # (n, H)
     dim = float(d["dim"])
-    alive = d["uav_alive"][steps]                                           # (n, U)
-    dxy = d["uav_xy"][steps][:, None, :, :] - d["ch_xy"][None, :, None, :]   # (n, K, U, 2)
-    dist = np.hypot(dxy[..., 0], dxy[..., 1]) / dim
-    dist = np.where(alive[:, None, :], dist, 2.0).min(2)
-    size = np.repeat((d["cluster_size"] / 10.0)[None, :], len(steps), 0)
-    to_base = np.repeat((d["charger_m"] / dim)[None, :], len(steps), 0)      # 0 when there is no base
-    X = np.concatenate([hist, tm, size[..., None], dist[..., None], to_base[..., None]], 2).reshape(-1, a.history * F + 7)
-    # targets: true charge, out now or within 60 min, sensor-outage share; col 3 = out now (scoring only)
-    Y = np.stack([d["ch_soc"][steps] / 100.0, d["ch_out_60"][steps].astype(np.float32),
-                  d["sens_frac"][steps], d["ch_out"][steps].astype(np.float32)], 2).reshape(-1, 4)
+    tr = np.stack([d["ch_soc"][steps] / 100.0, d["ch_out_60"][steps].astype(np.float32),
+                   d["sens_frac"][steps], d["ch_out"][steps].astype(np.float32)], 2)[:, keep]   # (n, K, 4)
+    size = (d["cluster_size"][keep] / 10.0).astype(np.float32)
+    to_base = (d["charger_m"][keep] / dim).astype(np.float32)               # 0 when there is no base
+    K = len(ugv_idx)
+    if getattr(a, "knowledge", "fleet") == "local":
+        if "uv_obs" not in d:
+            raise SystemExit("these episodes have no per-UAV knowledge (collected before --knowledge local); "
+                             "collect new episodes, or pass --knowledge fleet")
+        U = d["uv_obs"].shape[1]
+        hist = d["uv_obs"][frames][:, :, :, keep]                           # (n, H, U, K, F)
+        hist = hist.transpose(0, 2, 3, 1, 4).reshape(n, U, K, -1)
+        xy = d["uav_xy"][steps]                                             # (n, U, 2)
+        dxy = xy[:, :, None, :] - d["ch_xy"][keep][None, None, :, :]
+        dist = (np.hypot(dxy[..., 0], dxy[..., 1]) / dim).astype(np.float32)   # (n, U, K)
+        batt = np.repeat((d["uav_soc"][steps] / 100.0)[:, :, None], K, 2)
+        tm = np.broadcast_to(d["time"][steps][:, None, None, :], (n, U, K, 4))
+        bc = lambda v: np.broadcast_to(v[None, None, :], (n, U, K))
+        X = np.concatenate([hist, tm, bc(size)[..., None], dist[..., None], bc(to_base)[..., None],
+                            batt[..., None]], 3).reshape(n, U * K, -1)
+        Y = np.broadcast_to(tr[:, None], (n, U, K, 4)).reshape(n, U * K, 4)
+        alive = np.repeat(d["uav_alive"][steps][:, :, None], K, 2).reshape(n, U * K)
+        return X, Y, alive, np.tile(ugv_idx, U), np.repeat(np.arange(U), K)
+    hist = d["ch_obs"][frames][:, :, keep]                                  # (n, H, K, F)
+    hist = hist.transpose(0, 2, 1, 3).reshape(n, K, -1)
+    tm = np.repeat(d["time"][steps][:, None, :], K, 1)
+    alive_u = d["uav_alive"][steps]                                         # (n, U)
+    dxy = d["uav_xy"][steps][:, None, :, :] - d["ch_xy"][keep][None, :, None, :]   # (n, K, U, 2)
+    dist = np.where(alive_u[:, None, :], np.hypot(dxy[..., 0], dxy[..., 1]) / dim, 2.0).min(2)
+    X = np.concatenate([hist, tm, np.repeat(size[None], n, 0)[..., None], dist[..., None],
+                        np.repeat(to_base[None], n, 0)[..., None]], 2)
+    return X, tr, np.ones((n, K), bool), ugv_idx, np.full(K, -1)
+
+
+def ch_tokens(d, a, rng, cap):
+    """Tokens (N, D) and targets (N, 4) for one episode: the live rows of token_grid, step-major."""
+    X, Y, alive, _, _ = token_grid(d, a)
+    X, Y = X[alive], Y[alive]
     if cap and len(X) > cap:
         idx = rng.choice(len(X), cap, replace=False)
         X, Y = X[idx], Y[idx]
@@ -1141,8 +1342,7 @@ def cmd_features(a):
     check that what a controller needs (AoI, time since contact) survives the --k-token you choose."""
     from sklearn.decomposition import PCA
     (Xtr, _, _), _, _ = load_track("ch", a)
-    names = [f"{f}@-{l * a.history_stride}m".replace("@-0m", "@now") for l in range(a.history) for f in CH_FEATS]
-    names += ["day_phase", "doy_sin", "doy_cos", "sun_elev", "cluster_size", "nearest_uav_dist", "base_dist"]
+    names = token_names(a)
     ks = [k for k in (2, 4, 8, 16, 32) if k <= min(Xtr.shape)]
     p = PCA(max(ks)).fit(Xtr)
     tot = np.maximum(Xtr.var(0), 1e-12)
@@ -1281,8 +1481,24 @@ def parse(argv=None):
                    help="sensor tours: cached nearest-neighbour + 2-opt order, skipping fresh sensors and "
                         "truncated to what the battery allows (default), or the paper's Christofides split")
     w.add_argument("--tour-fresh-min", type=float, default=30.0, help="skip sensors refreshed this recently")
+    w.add_argument("--knowledge", choices=("local", "fleet"), default=None,
+                   help="local: each UAV knows only its own contacts, charges and uploads, plus records swapped with "
+                        "another airborne UAV in PLoRa range with line of sight; the tokens are per (UAV, UGV) from "
+                        "that knowledge and the shield uses the UAV's own UGV readings. fleet: the original "
+                        "fleet-shared view, one token per UGV (folders collected before this option). Default: "
+                        "what the folder was collected with; local for a new folder")
+    w.add_argument("--supply-margin", type=float, default=5.0,
+                   help="shield: a UGV can supply a UAV only above its 10%% reserve plus this. At 0 (folders made "
+                        "before this option) a UGV held at 10%% by its solar trickle traps UAVs in a charge-again loop")
+    w.add_argument("--plora-m", type=float, default=5000.0,
+                   help="air-to-air PLoRa range for UAVs swapping knowledge (m); 0 = never share")
+    w.add_argument("--intent-min", type=float, default=30.0,
+                   help="minutes a UAV trusts another UAV's destination heard over PLoRa")
+    w.add_argument("--uav-alt", type=float, default=60.0,
+                   help="UAV flight height above the terrain for air-to-air line of sight (m)")
     w.add_argument("--sortie-credit", choices=("gated", "visit"), default=None,
-                   help="sensor ages after a sortie: unset = gated (the original rule: refreshed only when the "
+                   help="sensor ages after a sortie (default: visit for a new folder, else what it was collected "
+                        "with): gated = the original rule (refreshed only when the "
                         "returning UAV's lifetime data from the CH exceeds the CH's total uploads, which with several "
                         "UAVs almost never happens); visit = refreshed when a UAV collects from the sensor")
     w.add_argument("--charger-divert", action=argparse.BooleanOptionalAction, default=True,
@@ -1334,6 +1550,15 @@ def parse(argv=None):
         a.suff_fracs = [0.5, 1.0]
         a.ch_budgets, a.map_budgets = [4, 16], [8, 32]
         a.max_train, a.max_eval, a.max_probe, a.max_epochs, a.patience = 20_000, 5_000, 5_000, 5, 2
+    import json                  # settings not given: what the folder was collected with; new folders: the fixes
+    p = os.path.join(a.out, "data", "world_config.json")
+    old = json.load(open(p)) if os.path.exists(p) else None
+    if a.knowledge is None:
+        a.knowledge = (old.get("knowledge") or "fleet") if old is not None else "local"
+    if a.sortie_credit is None and old is None:
+        a.sortie_credit = "visit"
+    elif a.sortie_credit is None:
+        a.sortie_credit = old.get("sortie_credit")
     return a
 
 

@@ -131,6 +131,7 @@ class QuadUAV:
     def reset(self):
         self.short_minutes = 0
         self.seek_charge = False
+        self.known_soc = {}        # this UAV's own reading of each UGV's charge (CFG.local_knowledge)
         # Reset Flags
         self.stored_energy = 100
         self.total_amp_spent = 0.0
@@ -422,8 +423,9 @@ class QuadUAV:
         else:
             ### TargetType > sensor
 
-            # The fleet's reading of this CH's battery (shared through the fleet's comms)
+            # The fleet's reading of this CH's battery (shared through the fleet's comms), and this UAV's own
             self.target.perceived_soc = 100.0 if getattr(self.target, "is_base", False) else self.target.stored_energy
+            self.known_soc[self.target.cluster_num] = self.target.perceived_soc
 
             # True, True, sensor, CHstate, action, action_p
             (used_model, changed_transit, dest, state, action, action_p, p_state,
@@ -553,6 +555,15 @@ class QuadUAV:
     def _leg_pct(self, dist):
         return CFG.tour_margin * ablation.minutes_pct(ablation.leg_minutes(dist))
 
+    def known_charge(self, ch):
+        """Charge reading the shield uses for a charger: the fleet-shared reading, or with CFG.local_knowledge
+        this UAV's own (its last contact, or a newer one relayed by another UAV in the air; prior 50 %)."""
+        if getattr(ch, "is_base", False):
+            return 100.0
+        if CFG.local_knowledge:
+            return getattr(self, "known_soc", {}).get(ch.cluster_num, 50.0)
+        return ch.perceived_soc
+
     def _pick_charger(self):
         """
         Best reachable charger other than the current one: score = distance / rating, rating = the
@@ -565,12 +576,13 @@ class QuadUAV:
             if ch is self.target:
                 continue
             base = getattr(ch, "is_base", False)
-            if not base and ch.perceived_soc < CFG.divert_min_soc:
+            soc = self.known_charge(ch)
+            if not base and soc < CFG.divert_min_soc:
                 continue
             d = math.hypot(ch.id_x - self.id_x, ch.id_y - self.id_y)
             if self.state[0][2] - self._leg_pct(d) < 2.0:
                 continue
-            score = d / max(ablation.charger_rating(ch), 1e-3)
+            score = d / max(ablation.charger_rating(ch, soc), 1e-3)
             if score < best_score:
                 best, best_score = ch, score
         return best

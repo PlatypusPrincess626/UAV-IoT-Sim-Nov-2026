@@ -771,7 +771,8 @@ def prepare(tok, mapc, S, a):
     mmu, msd = D["train"]["Zm"].mean(0), D["train"]["Zm"].std(0) + 1e-9
     for name in D:
         zs = (D[name]["Zt"] - zmu) / zsd
-        D[name].update(zs=zs, inp=M.to_inputs(zs, (D[name]["Zm"] - mmu) / msd, S[name]["A"]), X=S[name]["X"],
+        D[name].update(zs=zs, inp=M.to_inputs(zs, (D[name]["Zm"] - mmu) / msd, S[name]["A"], S[name].get("Mk")),
+                       X=S[name]["X"],
                        zm=(D[name]["Zm"] - mmu) / msd)
     return D, (zmu, zsd)
 
@@ -787,7 +788,7 @@ def run_arm(arm, seed, a, b, D, zstats, tok, S):
             row.update({f"{name}_{k}": v for k, v in r.items()})
         N, n, _ = Hh.shape
         z = D[name]["zs"].reshape(N * n, -1)
-        zm = np.repeat(D[name]["zm"], n, 0)
+        zm = D[name]["inp"][..., a.k_token:-1].reshape(N * n, -1)          # the map latent M was given
         feats[name] = (np.concatenate([z, zm, Hh.reshape(N * n, -1)], 1), np.concatenate([z, zm], 1),
                        S[name]["Y"].reshape(N * n, 4))
     for tag, col in (("mem", 0), ("zonly", 1)):

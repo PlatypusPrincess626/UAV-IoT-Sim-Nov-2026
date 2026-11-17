@@ -40,6 +40,9 @@ class AblationConfig:
     # collected) a UGV held just above 10 % by its solar trickle passes the check, so a UAV whose next leg
     # needs more battery is told to charge there again and again and never leaves. Ctrl_test.py sets 5.
     supply_margin: float = 0.0
+    # Shield knowledge: False = the fleet-shared UGV charge reading (as collected before); True = each UAV's
+    # own reading (its contacts plus records relayed air-to-air over PLoRa with line of sight).
+    local_knowledge: bool = False
     charger_divert: bool = False
     divert_after: int = 2
     divert_min_soc: float = 30.0
@@ -106,8 +109,10 @@ def minutes_pct(minutes: float) -> float:
     return minutes * 60.0 * flight_cost_per_s()
 
 
-def charger_rating(ch) -> float:
-    """Perceived usable charge of a charger, 0..1 above the 10 % reserve; the base station is always 1."""
+def charger_rating(ch, soc=None) -> float:
+    """Perceived usable charge of a charger, 0..1 above the 10 % reserve; the base station is always 1.
+    soc: the reading to use (a UAV's own, with CFG.local_knowledge); default the fleet-shared one."""
     if getattr(ch, "is_base", False):
         return 1.0
-    return float(min(max((ch.perceived_soc - 10.0) / 90.0, 0.0), 1.0))
+    soc = ch.perceived_soc if soc is None else soc
+    return float(min(max((soc - 10.0) / 90.0, 0.0), 1.0))
