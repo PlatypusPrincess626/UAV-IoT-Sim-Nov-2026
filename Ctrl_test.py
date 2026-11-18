@@ -417,8 +417,11 @@ def h_stats(m, D):
     """Statistics of the memory state the controller reads, over the training sequences (teacher forced):
     per-dimension mean and sd, then the principal components of the standardised state."""
     dev = next(m.parameters()).device
+    inp = D["train"]["inp"]
+    if len(inp) > 2000:                                  # plenty for means and principal components; bounded RAM
+        inp = inp[np.sort(np.random.default_rng(0).choice(len(inp), 2000, replace=False))]
     with torch.no_grad():
-        X = torch.tensor(D["train"]["inp"])
+        X = torch.tensor(inp)
         H = np.concatenate([m(X[i:i + 64].to(dev))[0].flatten(0, 1).cpu().numpy() for i in range(0, len(X), 64)])
     mu, sd = H.mean(0), H.std(0) + 1e-6
     Hs = (H - mu) / sd

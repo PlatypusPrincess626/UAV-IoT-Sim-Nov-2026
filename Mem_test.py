@@ -79,6 +79,8 @@ def parse(argv=None):
     ap.add_argument("--map-max-train", type=int, default=None, help="cap on map patches for the map VAE")
     ap.add_argument("--map-max-epochs", type=int, default=None, help="epoch cap for the map VAE")
     ap.add_argument("--min-onset", type=int, default=500)
+    ap.add_argument("--eval-batch", type=int, default=512,
+                    help="sequences per GPU batch in evaluation and dream rollouts (lower it if the GPU runs out of memory)")
     ap.add_argument("--controls", action=argparse.BooleanOptionalAction, default=True,
                     help="also run vae_sampled and the best linear configuration with matched noise")
     ap.add_argument("--device", default="auto")
@@ -315,21 +317,24 @@ def evaluate(m, split, tok, zstats, a, b, dreams=True):
     starts = list(range(12, n - hmax, 12)) if dreams else []
     got = {h: ([], []) for h in a.rollout}
     dz = zs.shape[2]
+    eb = getattr(a, "eval_batch", 512)
     with torch.no_grad():
         for t0 in starts:
-            x = torch.tensor(inp[:, :t0 + 1]).to(dev)
-            _, st, lp, mu, _ = m(x)
-            z = m.mean(lp[:, -1:], mu[:, -1:])                                 # prediction of z_{t0+1}
-            for j in range(1, hmax + 1):
-                if j in got:
-                    got[j][0].append(z[:, 0].cpu().numpy())
-                    got[j][1].append(X[:, t0 + j])
-                if j == hmax:
-                    break
-                step = torch.tensor(inp[:, t0 + j:t0 + j + 1]).to(dev).clone()
-                step[..., :dz] = z
-                _, st, lp, mu, _ = m(step, st)
-                z = m.mean(lp, mu)
+            for b0 in range(0, len(inp), eb):                 # sequences in batches: GPU memory stays bounded
+                sl = slice(b0, b0 + eb)
+                x = torch.tensor(inp[sl, :t0 + 1]).to(dev)
+                _, st, lp, mu, _ = m(x)
+                z = m.mean(lp[:, -1:], mu[:, -1:])                             # prediction of z_{t0+1}
+                for j in range(1, hmax + 1):
+                    if j in got:
+                        got[j][0].append(z[:, 0].cpu().numpy())
+                        got[j][1].append(X[sl, t0 + j])
+                    if j == hmax:
+                        break
+                    step = torch.tensor(inp[sl, t0 + j:t0 + j + 1]).to(dev).clone()
+                    step[..., :dz] = z
+                    _, st, lp, mu, _ = m(step, st)
+                    z = m.mean(lp, mu)
     for h, (P, T) in (got.items() if dreams else ()):
         res[f"roll{h}_fvu"] = fvu(dec(np.concatenate(P)[:, None]), np.concatenate(T)[:, None])
     return res, H

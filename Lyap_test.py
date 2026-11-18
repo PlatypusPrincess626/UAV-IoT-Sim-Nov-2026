@@ -127,6 +127,8 @@ def parse(argv=None):
     ap.add_argument("--map-max-train", type=int, default=None, help="cap on map patches loaded (linear fit)")
     ap.add_argument("--map-max-epochs", type=int, default=None)
     ap.add_argument("--min-onset", type=int, default=500)
+    ap.add_argument("--eval-batch", type=int, default=512,
+                    help="sequences per GPU batch in evaluation and dream rollouts (lower it if the GPU runs out of memory)")
     ap.add_argument("--device", default="auto")
     a, rest = ap.parse_known_args(argv)
     b = V.parse(["run", "--out", a.out, "--device", a.device] + rest)
