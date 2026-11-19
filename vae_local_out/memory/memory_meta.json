@@ -1,0 +1,1 @@
+{"linear":["db2","fft","dct"],"onset":{"train":118626,"val":32280,"test":52458},"sequences":{"train":30642,"val":8178,"test":12546},"steps":144}
