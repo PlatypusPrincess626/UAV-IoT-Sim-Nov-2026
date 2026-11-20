@@ -8,6 +8,14 @@ Settings (every combination is run; 36 km^2 is the anchor, where both fleet rule
   --fleets density sqrt    density: sensors, UAVs and CH cap all grow with the area (6 / 20 / 67 UAVs);
                            sqrt: sensors and CH cap grow with the area, the fleet with its square root (6 / 11 / 20)
   --docks 0 2              grid-powered docks at outbuildings besides the farmhouse base (0 = farmhouse only)
+  --foliage default        how wooded the farm is, to find the bounds of viability (presets below; default
+                           = the collected data's ranges). Each preset sets per-world uniform ranges:
+                             none     no trees at all: no woodlots, no hedgerows (the open-sky baseline)
+                             sparse   woodlots 5-10 % of blocks, tree cover 10-25 %, hedgerows 5 m
+                             default  woodlots 10-30 %,          tree cover 15-50 %, hedgerows 15 m
+                             dense    woodlots 30-50 %,          tree cover 50-80 %, hedgerows 30 m
+                           More trees mean more shade (less solar charging for sensors and UGVs) and more
+                           blocked line of sight (sensor links, PLoRa between UAVs).
 Each world is built and run exactly as VAE_test.py collects an episode (same world settings as a new folder:
 UAV-local knowledge, visit credit, supply margin 5), with the --policy behaviour policy (greedy by default), then
 measured. Worlds use seeds 500000 + i, disjoint from the collected data and the controller's worlds, and the
@@ -19,6 +27,8 @@ What it reports per world (pilot_runs.csv) and per setting (pilot_summary.csv, m
               flight_ok (a CH layout within [min K, max K] passed the flight check; 0 = K had to grow past
               the cap), farthest_km and round_trip_pct (farthest sensor from its CH and the round trip it costs),
               base_km_mean / base_km_max (UGV to the nearest guaranteed charger)
+  foliage     tree_cover and woodlot_frac drawn for the world; sun_ugv / sun_sensor (daily mean sunlight
+              transmittance at the UGV CHs and at the sensors: 0 = full shade, 1 = open sky)
   knowledge   heard_60 (share of UAV-UGV pairs heard from, directly or relayed, within the last 60 min),
               heard_end (share heard from at least once by the end of the day), links_per_uav_h (PLoRa
               exchanges per UAV per hour)
@@ -29,6 +39,7 @@ The summary also extrapolates a full collection: hours for --plan-worlds worlds 
 Run
   python Scale_pilot.py --out scale_pilot --workers 16                       # all 36 / 120 / 400 settings, 24 worlds
   python Scale_pilot.py --out scale_pilot --areas 400 --fleets sqrt --worlds 8   # a quick look at one setting
+  python Scale_pilot.py --out scale_pilot --foliage none sparse dense --docks 0 --worlds 12   # foliage bounds
   python Scale_pilot.py --out scale_pilot --report                           # summary only
 Finished worlds are kept in pilot_runs.csv and skipped when rerun.
 """
@@ -47,7 +58,11 @@ import pandas as pd
 import VAE_test as V
 
 WORLD_BASE = 500_000
-KEYS = ["area_km2", "fleet", "docks"]
+KEYS = ["area_km2", "fleet", "docks", "foliage"]
+FOLIAGE = {"none": ["--woodlot-frac", "0", "0", "--tree-cover", "0", "0", "--hedgerow-m", "0"],
+           "sparse": ["--woodlot-frac", "0.05", "0.10", "--tree-cover", "0.10", "0.25", "--hedgerow-m", "5"],
+           "default": [],
+           "dense": ["--woodlot-frac", "0.30", "0.50", "--tree-cover", "0.50", "0.80", "--hedgerow-m", "30"]}
 
 
 def parse(argv=None):
@@ -56,6 +71,7 @@ def parse(argv=None):
     ap.add_argument("--areas", type=float, nargs="+", default=[36.0, 120.0, 400.0])
     ap.add_argument("--fleets", nargs="+", choices=("density", "sqrt"), default=["density", "sqrt"])
     ap.add_argument("--docks", type=int, nargs="+", default=[0, 2])
+    ap.add_argument("--foliage", nargs="+", choices=tuple(FOLIAGE), default=["default"])
     ap.add_argument("--worlds", type=int, default=24)
     ap.add_argument("--policy", choices=("greedy", "random", "rotation"), default="greedy")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -71,23 +87,24 @@ def settings(a):
     for area in a.areas:
         for fleet in a.fleets:
             for docks in a.docks:
-                if area == 36.0 and fleet != a.fleets[0]:
-                    continue                               # the anchor: both rules give 6 UAVs
-                out.append((area, fleet, docks))
+                for fol in a.foliage:
+                    if area == 36.0 and fleet != a.fleets[0]:
+                        continue                           # the anchor: both rules give 6 UAVs
+                    out.append((area, fleet, docks, fol))
     return out
 
 
-def world_args(area, fleet, docks, extra):
+def world_args(area, fleet, docks, foliage, extra):
     a = V.parse(["collect", "--out", os.path.join("__pilot_no_folder__"), "--area-km2", str(area), "--scale", fleet,
-                 "--satellite-docks", str(docks)] + list(extra))
+                 "--satellite-docks", str(docks)] + FOLIAGE[foliage] + list(extra))
     a.verbose = False
     return a
 
 
 def run_one(job):
-    area, fleet, docks, w, policy, extra = job
+    area, fleet, docks, foliage, w, policy, extra = job
     import resource
-    a = world_args(area, fleet, docks, extra)
+    a = world_args(area, fleet, docks, foliage, extra)
     seed = WORLD_BASE + w
     tm = {}
     with contextlib.redirect_stdout(io.StringIO()):
@@ -105,7 +122,11 @@ def run_one(job):
     tried = sel.get("tried") or []
     flight_ok = any(ok for K, sc, ok, inf in tried if sc is not None)
     since = d["uv_obs"][:, :, ugv, 1] * T                    # minutes since the newest reading, per UAV and UGV
-    row = dict(area_km2=area, fleet=fleet, docks=docks, world=w, policy=policy,
+    sun = np.asarray(d["sun"], float)[:, 0]                 # daily mean transmittance per point
+    ch_sun = sun[d["kinds"] == 2]                            # the CH points, in d["ch_xy"] order
+    row = dict(area_km2=area, fleet=fleet, docks=docks, foliage=foliage, world=w, policy=policy,
+               tree_cover=float(info["tree_cover"]), woodlot_frac=float(info["woodlot_frac"]),
+               sun_ugv=float(ch_sun[ugv].mean()), sun_sensor=float(sun[d["kinds"] == 1].mean()),
                sensors=a.sensors, uavs=U, ugvs=int(ugv.sum()), bases=int(base.sum()), pairs=int(U * len(base)),
                deaths=int(U - d["uav_alive"][-1].sum()),
                ugv_out_min=float(d["ch_out"][:, ugv].sum()),
@@ -124,6 +145,17 @@ def run_one(job):
     return row
 
 
+def append_row(path, row):
+    """Append one world; if the file was written by an older pilot (other columns), rewrite it with both."""
+    if os.path.exists(path):
+        with open(path) as f:
+            head = f.readline().strip().split(",")
+        if head != list(row):
+            pd.concat([pd.read_csv(path), pd.DataFrame([row])], ignore_index=True).to_csv(path, index=False)
+            return
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+
 def ci95(x):
     x = np.asarray(x, float)
     x = x[~np.isnan(x)]
@@ -139,6 +171,13 @@ def report(a):
             "avg_aoi", "flight_ok", "farthest_km", "round_trip_pct", "base_km_mean", "base_km_max", "heard_60",
             "heard_end", "links_per_uav_h", "build_s", "episode_s", "extras_s", "save_s", "file_mb", "peak_rss_mb"]
     rows = []
+    if "foliage" not in d.columns:
+        d["foliage"] = "default"
+    d["foliage"] = d["foliage"].fillna("default")
+    for c in ("tree_cover", "woodlot_frac", "sun_ugv", "sun_sensor"):
+        if c not in d.columns:
+            d[c] = np.nan
+    cols = cols + ["tree_cover", "woodlot_frac", "sun_ugv", "sun_sensor"]
     for key, g in d.groupby(KEYS, sort=False):
         r = dict(zip(KEYS, key), worlds=len(g), acres=round(key[0] * 247.105))
         for c in cols:
@@ -151,7 +190,7 @@ def report(a):
     s = pd.DataFrame(rows)
     s.to_csv(os.path.join(a.out, "pilot_summary.csv"), index=False)
     pd.set_option("display.width", 250)
-    show = ["area_km2", "acres", "fleet", "docks", "worlds", "uavs", "ugvs", "bases", "deaths", "ugv_out_per_ugv",
+    show = ["area_km2", "acres", "fleet", "docks", "foliage", "worlds", "sun_ugv", "uavs", "ugvs", "bases", "deaths", "ugv_out_per_ugv",
             "peak_aoi", "avg_aoi", "flight_ok", "base_km_max", "heard_60", "episode_s", "file_mb", "peak_rss_mb",
             "collect_h", "disk_gb", "ram_gb_all_workers"]
     print(s[show].round(2).to_string(index=False))
@@ -169,9 +208,10 @@ def main(argv=None):
     have = set()
     if os.path.exists(path):
         d = pd.read_csv(path)
-        have = set(zip(d.area_km2, d.fleet, d.docks, d.world))
-    jobs = [(area, fleet, docks, w, a.policy, a.world_args) for area, fleet, docks in settings(a)
-            for w in range(a.worlds) if (area, fleet, docks, w) not in have]
+        fol = d["foliage"].fillna("default") if "foliage" in d.columns else ["default"] * len(d)
+        have = set(zip(d.area_km2, d.fleet, d.docks, fol, d.world))
+    jobs = [(area, fleet, docks, fol, w, a.policy, a.world_args) for area, fleet, docks, fol in settings(a)
+            for w in range(a.worlds) if (area, fleet, docks, fol, w) not in have]
     jobs.sort(key=lambda j: -j[0])                         # largest farms first: they set the wall time
     print(f"pilot: {len(jobs)} worlds to run over {len(settings(a))} settings with {a.workers} worker(s)", flush=True)
     import multiprocessing as mp
@@ -181,8 +221,9 @@ def main(argv=None):
     t0 = time.time()
     with ProcessPoolExecutor(a.workers, **kw) as ex:
         for n, row in enumerate(ex.map(run_one, jobs), 1):
-            pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
-            print(f"[{n}/{len(jobs)}] {row['area_km2']:g} km2 {row['fleet']} docks {row['docks']} world {row['world']}: "
+            append_row(path, row)
+            print(f"[{n}/{len(jobs)}] {row['area_km2']:g} km2 {row['fleet']} docks {row['docks']} {row['foliage']} "
+                  f"world {row['world']}: sun at UGVs {row['sun_ugv']:.2f}  "
                   f"{row['uavs']} UAVs {row['ugvs']} UGVs  deaths {row['deaths']}  UGV-out {row['ugv_out_per_ugv']:.0f} "
                   f"min/UGV  peak AoI {row['peak_aoi']:.0f}  heard<60min {row['heard_60']:.2f}  "
                   f"episode {row['episode_s']:.0f}s  file {row['file_mb']:.0f} MB  RAM {row['peak_rss_mb']:.0f} MB  "
