@@ -611,13 +611,13 @@ WORLD_KEYS = ("area_km2", "sensors", "uavs", "num_ch", "ch_select", "min_ch", "m
               "uav_reserve", "flight_margin", "val_frac", "test_frac", "terrain", "policy_cycle", "ch_start_soc",
               "sensor_start_soc", "uav_start_soc", "layout", "field_m", "woodlot_frac", "hedgerow_m",
               "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "sortie_credit", "knowledge", "uav_alt", "plora_m", "intent_min", "supply_margin", "bs_exclusion_m",
-              "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base", "satellite_docks", "scale")
+              "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base", "satellite_docks", "scale", "ch_scale")
 RUN_KEYS = ("n_episodes", "val_frac", "test_frac", "history", "history_stride", "token_every", "z_clip", "max_train", "max_eval",
             "max_probe", "max_epochs", "patience", "batch", "lr", "beta", "kl_tol")
 
 
 LEGACY = {"knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0,
-          "satellite_docks": 0, "scale": "none", "near_ch": "0"}   # what a folder made before these settings existed used
+          "satellite_docks": 0, "scale": "none", "ch_scale": "area", "near_ch": "0"}   # what a folder made before these settings existed used
 
 
 def check_config(path, a, keys, what):
@@ -1499,6 +1499,9 @@ def parse(argv=None):
                    help="set --sensors, --uavs and --max-ch from --area-km2 by the --scale-ref farm: density = all "
                         "three grow with the area; sqrt = sensors and CH cap grow with the area, the fleet with "
                         "its square root; none = use the given values")
+    w.add_argument("--ch-scale", choices=("area", "sqrt"), default="area",
+                   help="with --scale: the CH (UGV) cap grows with the area (area) or with its square root (sqrt, "
+                        "fewer, larger clusters: 10 / 18 / 33 at 36 / 120 / 400 km2)")
     w.add_argument("--scale-ref", type=float, nargs=4, default=(36.0, 200.0, 6.0, 10.0),
                    metavar=("KM2", "SENSORS", "UAVS", "MAX_CH"), help="the reference farm for --scale")
     w.add_argument("--sweep", choices=("cached", "christofides"), default="cached",
@@ -1594,7 +1597,7 @@ def apply_scale(a):
     ref_a, ref_s, ref_u, ref_c = a.scale_ref
     r = a.area_km2 / ref_a
     a.sensors = int(round(ref_s * r))
-    a.max_ch = max(int(round(ref_c * r)), a.min_ch)
+    a.max_ch = max(int(round(ref_c * (r if getattr(a, "ch_scale", "area") == "area" else math.sqrt(r)))), a.min_ch)
     a.uavs = int(round(ref_u * (r if a.scale == "density" else math.sqrt(r))))
     a.max_ch = max(a.max_ch, a.uavs)
 

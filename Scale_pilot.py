@@ -6,7 +6,9 @@ new farm size, run a few worlds per setting and measure whether the setting is v
 Settings (every combination is run; 36 km^2 is the anchor, where both fleet rules give the same 6 UAVs)
   --areas 36 120 400       farm area in km^2 (36 ~ 8,900 acres, 120 ~ 30,000, 400 ~ 100,000)
   --fleets density sqrt    density: sensors, UAVs and CH cap all grow with the area (6 / 20 / 67 UAVs);
-                           sqrt: sensors and CH cap grow with the area, the fleet with its square root (6 / 11 / 20)
+                           sqrt: sensors and CH cap grow with the area, the fleet with its square root (6 / 11 / 20);
+                           balanced: sensors grow with the area, UAVs and the CH (UGV) cap with its square root
+                           (6 / 11 / 20 UAVs, at most 10 / 18 / 33 UGVs): fewer, larger clusters
   --docks 0 2              grid-powered docks at outbuildings besides the farmhouse base (0 = farmhouse only)
   --foliage default        how wooded the farm is, to find the bounds of viability (presets below; default
                            = the collected data's ranges). Each preset sets per-world uniform ranges:
@@ -59,6 +61,8 @@ import VAE_test as V
 
 WORLD_BASE = 500_000
 KEYS = ["area_km2", "fleet", "docks", "foliage"]
+FLEETS = {"density": ["--scale", "density"], "sqrt": ["--scale", "sqrt"],
+          "balanced": ["--scale", "sqrt", "--ch-scale", "sqrt"]}
 FOLIAGE = {"none": ["--woodlot-frac", "0", "0", "--tree-cover", "0", "0", "--hedgerow-m", "0"],
            "sparse": ["--woodlot-frac", "0.05", "0.10", "--tree-cover", "0.10", "0.25", "--hedgerow-m", "5"],
            "default": [],
@@ -69,7 +73,7 @@ def parse(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="scale_pilot")
     ap.add_argument("--areas", type=float, nargs="+", default=[36.0, 120.0, 400.0])
-    ap.add_argument("--fleets", nargs="+", choices=("density", "sqrt"), default=["density", "sqrt"])
+    ap.add_argument("--fleets", nargs="+", choices=tuple(FLEETS), default=["density", "sqrt"])
     ap.add_argument("--docks", type=int, nargs="+", default=[0, 2])
     ap.add_argument("--foliage", nargs="+", choices=tuple(FOLIAGE), default=["default"])
     ap.add_argument("--worlds", type=int, default=24)
@@ -95,8 +99,8 @@ def settings(a):
 
 
 def world_args(area, fleet, docks, foliage, extra):
-    a = V.parse(["collect", "--out", os.path.join("__pilot_no_folder__"), "--area-km2", str(area), "--scale", fleet,
-                 "--satellite-docks", str(docks)] + FOLIAGE[foliage] + list(extra))
+    a = V.parse(["collect", "--out", os.path.join("__pilot_no_folder__"), "--area-km2", str(area)] + FLEETS[fleet]
+                + ["--satellite-docks", str(docks)] + FOLIAGE[foliage] + list(extra))
     a.verbose = False
     return a
 
