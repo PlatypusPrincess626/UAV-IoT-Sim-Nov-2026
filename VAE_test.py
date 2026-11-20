@@ -254,7 +254,7 @@ def build_world(ep_seed, a):
                   terrain_feature_m=a.terrain_feature_m, layout=a.layout, field_m=a.field_m,
                   woodlot_frac=woodlot, hedgerow_m=a.hedgerow_m,
                   base_station=a.base_station and a.layout == "farm", bs_exclusion_m=a.bs_exclusion_m,
-                  sensors_per_field=a.sensors_per_field)
+                  sensors_per_field=a.sensors_per_field, satellite_docks=getattr(a, "satellite_docks", 0))
     sel = env.ch_selection or {}
     return env, dict(doy=doy, date=date, tree_cover=cover, stand_size_m=sigma, woodlot_frac=woodlot,
                      farthest_m=(sel.get("info") or {}).get("farthest_m", np.nan),
@@ -556,6 +556,35 @@ def sunlight(env, pts):
     return np.column_stack([(T * w).sum(1) / max(w.sum(), 1e-9)] + q).astype(np.float32)
 
 
+def make_episode(ep_seed, a, policy, timings=None):
+    """Build a world, run one episode with the behaviour policy, and add the map and sun data: what an
+    episode file holds. timings (dict), if given, gets build_s / episode_s / extras_s."""
+    t0 = time.time()
+    env, info = build_world(ep_seed, a)
+    t1 = time.time()
+    d = run_episode(env, info, policy, ep_seed, a)
+    t2 = time.time()
+    rng = np.random.default_rng(ep_seed + 2)
+    sens = np.array([(env.sensor_table.iat[i, 0].id_x, env.sensor_table.iat[i, 0].id_y)
+                     for i in range(len(env.sensor_table))], float)
+    margin = PATCH * CELL_M / 2 + 10
+    rnd = rng.uniform(margin, env.dim - margin, size=(a.random_patches, 2))
+    pts = np.vstack([sens, d["ch_xy"], rnd])
+    kinds = np.concatenate([np.ones(len(sens), int), np.full(len(d["ch_xy"]), 2), np.zeros(len(rnd), int)])
+    P = env.pad_cells
+    h = env.topo_mask[P:P + env.map_cells, P:P + env.map_cells]
+    gy, gx = np.gradient(h, env.map_res)
+    slope = np.degrees(np.arctan(np.hypot(gx, gy)))
+    d.update(patches=node_patches(env, pts), sun=sunlight(env, pts), kinds=kinds,
+             policy=policy, doy=info["doy"], tree_cover=info["tree_cover"],
+             stand_size_m=info["stand_size_m"], farthest_m=np.float32(info["farthest_m"]),
+             round_trip_pct=np.float32(info["round_trip_pct"]), slope_p50_p90=np.percentile(slope, [50, 90]).astype(np.float32),
+             relief_m=np.float32(np.ptp(h)))
+    if timings is not None:
+        timings.update(build_s=t1 - t0, episode_s=t2 - t1, extras_s=time.time() - t2, env=env, info=info)
+    return d
+
+
 def collect_one(job):
     ep, a = job
     path = os.path.join(a.out, "data", f"ep_{ep:04d}.npz")
@@ -565,24 +594,9 @@ def collect_one(job):
     ep_seed = a.seed_base + ep
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink if not a.verbose else sys.stdout):
-        env, info = build_world(ep_seed, a)
-        d = run_episode(env, info, a.policy_cycle[ep % len(a.policy_cycle)], ep_seed, a)
-        rng = np.random.default_rng(ep_seed + 2)
-        sens = np.array([(env.sensor_table.iat[i, 0].id_x, env.sensor_table.iat[i, 0].id_y)
-                         for i in range(len(env.sensor_table))], float)
-        margin = PATCH * CELL_M / 2 + 10
-        rnd = rng.uniform(margin, env.dim - margin, size=(a.random_patches, 2))
-        pts = np.vstack([sens, d["ch_xy"], rnd])
-        kinds = np.concatenate([np.ones(len(sens), int), np.full(len(d["ch_xy"]), 2), np.zeros(len(rnd), int)])
-        P = env.pad_cells
-        h = env.topo_mask[P:P + env.map_cells, P:P + env.map_cells]
-        gy, gx = np.gradient(h, env.map_res)
-        slope = np.degrees(np.arctan(np.hypot(gx, gy)))
-        d.update(patches=node_patches(env, pts), sun=sunlight(env, pts), kinds=kinds,
-                 policy=a.policy_cycle[ep % len(a.policy_cycle)], doy=info["doy"], tree_cover=info["tree_cover"],
-                 stand_size_m=info["stand_size_m"], farthest_m=np.float32(info["farthest_m"]),
-                 round_trip_pct=np.float32(info["round_trip_pct"]), slope_p50_p90=np.percentile(slope, [50, 90]).astype(np.float32),
-                 relief_m=np.float32(np.ptp(h)))
+        tm = {}
+        d = make_episode(ep_seed, a, a.policy_cycle[ep % len(a.policy_cycle)], tm)
+        info = tm["info"]
     tmp = path[:-4] + ".tmp.npz"
     np.savez_compressed(tmp, **d)
     os.replace(tmp, path)                          # never leave a half-written episode behind
@@ -597,12 +611,13 @@ WORLD_KEYS = ("area_km2", "sensors", "uavs", "num_ch", "ch_select", "min_ch", "m
               "uav_reserve", "flight_margin", "val_frac", "test_frac", "terrain", "policy_cycle", "ch_start_soc",
               "sensor_start_soc", "uav_start_soc", "layout", "field_m", "woodlot_frac", "hedgerow_m",
               "sensors_per_field", "base_station", "sweep", "charger_divert", "tour_fresh_min", "sortie_credit", "knowledge", "uav_alt", "plora_m", "intent_min", "supply_margin", "bs_exclusion_m",
-              "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base")
+              "terrain_feature_m", "tree_cover", "stand_size_m", "random_patches", "seed_base", "satellite_docks", "scale")
 RUN_KEYS = ("n_episodes", "val_frac", "test_frac", "history", "history_stride", "token_every", "z_clip", "max_train", "max_eval",
             "max_probe", "max_epochs", "patience", "batch", "lr", "beta", "kl_tol")
 
 
-LEGACY = {"knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0}   # what a folder made before these settings existed used
+LEGACY = {"knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0,
+          "satellite_docks": 0, "scale": "none", "near_ch": "0"}   # what a folder made before these settings existed used
 
 
 def check_config(path, a, keys, what):
@@ -1477,6 +1492,15 @@ def parse(argv=None):
     w.add_argument("--base-station", action=argparse.BooleanOptionalAction, default=True,
                    help="grid-powered base station at the farmstead (farm layout)")
     w.add_argument("--bs-exclusion-m", type=float, default=1500.0, help="UGVs park at least this far from the base")
+    w.add_argument("--satellite-docks", type=int, default=0,
+                   help="extra grid-powered docks at outbuildings (irrigation pivots, wells, barns) besides the "
+                        "farmhouse base, placed farthest-first across the farm; 0 = the farmhouse only")
+    w.add_argument("--scale", choices=("none", "density", "sqrt"), default="none",
+                   help="set --sensors, --uavs and --max-ch from --area-km2 by the --scale-ref farm: density = all "
+                        "three grow with the area; sqrt = sensors and CH cap grow with the area, the fleet with "
+                        "its square root; none = use the given values")
+    w.add_argument("--scale-ref", type=float, nargs=4, default=(36.0, 200.0, 6.0, 10.0),
+                   metavar=("KM2", "SENSORS", "UAVS", "MAX_CH"), help="the reference farm for --scale")
     w.add_argument("--sweep", choices=("cached", "christofides"), default="cached",
                    help="sensor tours: cached nearest-neighbour + 2-opt order, skipping fresh sensors and "
                         "truncated to what the battery allows (default), or the paper's Christofides split")
@@ -1555,11 +1579,24 @@ def parse(argv=None):
     old = json.load(open(p)) if os.path.exists(p) else None
     if a.knowledge is None:
         a.knowledge = (old.get("knowledge") or "fleet") if old is not None else "local"
+    apply_scale(a)
     if a.sortie_credit is None and old is None:
         a.sortie_credit = "visit"
     elif a.sortie_credit is None:
         a.sortie_credit = old.get("sortie_credit")
     return a
+
+
+def apply_scale(a):
+    """--scale: devices from the area at the reference farm's density (the fleet with sqrt(area) for 'sqrt')."""
+    if getattr(a, "scale", "none") == "none":
+        return
+    ref_a, ref_s, ref_u, ref_c = a.scale_ref
+    r = a.area_km2 / ref_a
+    a.sensors = int(round(ref_s * r))
+    a.max_ch = max(int(round(ref_c * r)), a.min_ch)
+    a.uavs = int(round(ref_u * (r if a.scale == "density" else math.sqrt(r))))
+    a.max_ch = max(a.max_ch, a.uavs)
 
 
 def main(argv=None):

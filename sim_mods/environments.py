@@ -115,7 +115,7 @@ class sim_env:
                  terrain_feature_m: float = TERRAIN_FEATURE_M, ch_range=None, ch_check=None,
                  layout: str = "open", field_m=(400.0, 800.0), woodlot_frac: float = 0.2,
                  hedgerow_m: float = 15.0, base_station: bool = False, bs_exclusion_m: float = 1500.0,
-                 sensors_per_field=(3, 8)):
+                 sensors_per_field=(3, 8), satellite_docks: int = 0):
         """
         area_km2           side of the square monitoring area is sqrt(area_km2) km (9 -> 3 km, 25 -> 5 km)
         num_ch             number of cluster heads K-means places (the paper uses 5)
@@ -138,6 +138,13 @@ class sim_env:
                            day there and can always charge there. UGV cluster heads are placed at least
                            bs_exclusion_m from it and on open field ground (nearest such spot to their
                            K-means centroid).
+        satellite_docks    farm only, with base_station: this many extra grid-powered docks (BaseStations) at
+                           outbuildings that already have mains power (irrigation pivots, well pumps, grain
+                           bins, barns). Placed on open field blocks inside the map, each as far as possible
+                           from the farmstead and the docks before it (farthest-point order, no random draws,
+                           so a world with 0 docks is unchanged). Like the farmstead base they take the
+                           sensors in backscatter range (at least the nearest one), never drain, and keep UGVs
+                           bs_exclusion_m away. UAVs still start the day at the farmstead.
         sensors_per_field  farm only: sensors go into instrumented fields, randint(lo, hi) per field,
                            the farmstead's field first, then fields picked at random.
         ch_range           (min_K, max_K): K-means with K chosen by the best silhouette score in that
@@ -156,6 +163,10 @@ class sim_env:
         self.layout, self.field_m, self.woodlot_frac = layout, tuple(field_m), float(woodlot_frac)
         self.hedgerow_m, self.base_station, self.bs_exclusion_m = float(hedgerow_m), bool(base_station), float(bs_exclusion_m)
         self.bs_xy = None
+        self.satellite_docks = int(satellite_docks)
+        if self.satellite_docks and not base_station:
+            raise ValueError("satellite docks need the farmstead base station (base_station=True)")
+        self.bs_sites = []
         self.sensors_per_field = (int(sensors_per_field[0]), int(sensors_per_field[1]))
         self.ch_range = None if ch_range is None else (int(ch_range[0]), int(ch_range[1]))
         if self.ch_range is not None and not 2 <= self.ch_range[0] <= self.ch_range[1] < num_sensors:
@@ -345,6 +356,21 @@ class sim_env:
         fy, fx = cand[rng.integers(len(cand))]
         wood_block[fy, fx] = False
         self.bs_xy = (float(CX[fy, fx]), float(CY[fy, fx]))
+        self.bs_sites = [self.bs_xy]
+        if self.base_station and self.satellite_docks:
+            # Outbuilding docks: farthest-point order over field blocks inside the map (deterministic, so
+            # the rng stream, and with it the rest of the landscape, is the same as without docks)
+            inside = np.argwhere((edge >= side / 2.0) & ~wood_block)
+            pts = np.column_stack([CX[inside[:, 0], inside[:, 1]], CY[inside[:, 0], inside[:, 1]]])
+            for _ in range(self.satellite_docks):
+                d = np.min([np.hypot(pts[:, 0] - x, pts[:, 1] - y) for x, y in self.bs_sites], 0)
+                j = int(np.argmax(d))
+                if d[j] <= 0:
+                    break
+                self.bs_sites.append((float(pts[j, 0]), float(pts[j, 1])))
+            for (x, y) in self.bs_sites[1:]:
+                k = np.argwhere((np.abs(CX - x) < 1e-6) & (np.abs(CY - y) < 1e-6))[0]
+                wood_block[k[0], k[1]] = False
         woodlot = wood_block[(by - by.min())[:, None], (bx - bx.min())[None, :]]
         farmstead = ((by - by.min())[:, None] == fy) & ((bx - bx.min())[None, :] == fx)
         # Hedgerows along block borders, with gaps
@@ -636,9 +662,10 @@ class sim_env:
         sites = self._ugv_sites(km.cluster_centers_)
         if not self.base_station:
             return ugv_pts, sites, km.labels_
-        pts = np.vstack([ugv_pts, all_pts[bs_members]])
-        labels = np.concatenate([km.labels_, np.full(len(bs_members), len(sites))])
-        return pts, np.vstack([sites, [self.bs_xy]]), labels
+        members = np.concatenate([m for m in bs_members]).astype(int) if len(bs_members) else np.array([], int)
+        pts = np.vstack([ugv_pts, all_pts[members]])
+        labels = np.concatenate([km.labels_] + [np.full(len(m), len(sites) + j) for j, m in enumerate(bs_members)])
+        return pts, np.vstack([sites, np.array(self.bs_sites, float)]), labels.astype(int)
 
     def place_devices(self) -> bool:
         sensor_pts = np.array([[0, 0]] * self.total_sensors, np.int32)
@@ -680,19 +707,26 @@ class sim_env:
             sensor_list.append([devices_iot.Sensor(x, y, long, lat, random.randint(1, 3))])
 
         # Base station: sensors within backscatter range report to it (at least the nearest one)
-        bs_members = np.array([], int)
+        bs_members = []                                   # per base site (farmstead first): its sensor indices
         ugv_idx = np.arange(self.total_sensors)
         if self.base_station:
-            d_bs = np.hypot(*(sensor_pts - np.array(self.bs_xy)).T)
-            bs_members = np.flatnonzero(d_bs <= MAX_DIST_AMBC)
-            if len(bs_members) == 0:
-                bs_members = np.array([int(np.argmin(d_bs))])
-            ugv_idx = np.setdiff1d(np.arange(self.total_sensors), bs_members)
+            sites = np.array(self.bs_sites, float)
+            d_all = np.hypot(sensor_pts[:, None, 0] - sites[None, :, 0], sensor_pts[:, None, 1] - sites[None, :, 1])
+            near = d_all.argmin(1)
+            taken = np.zeros(len(sensor_pts), bool)
+            for j in range(len(sites)):
+                m = np.flatnonzero((near == j) & (d_all[:, j] <= MAX_DIST_AMBC))
+                if len(m) == 0:                           # every base serves at least its nearest free sensor
+                    m = np.array([int(np.argmin(np.where(taken, np.inf, d_all[:, j])))])
+                taken[m] = True
+                bs_members.append(m)
+            ugv_idx = np.setdiff1d(np.arange(self.total_sensors), np.concatenate(bs_members))
             # Where a UGV may park: open field ground inside the map, at least bs_exclusion_m away
             from scipy.ndimage import distance_transform_edt
             ok = self.field_mask[P:P + self.map_cells, P:P + self.map_cells].copy()
             cy, cx = np.mgrid[0:self.map_cells, 0:self.map_cells]
-            ok &= np.hypot(cx * res + res / 2 - self.bs_xy[0], cy * res + res / 2 - self.bs_xy[1]) >= self.bs_exclusion_m
+            for (sx, sy) in self.bs_sites:
+                ok &= np.hypot(cx * res + res / 2 - sx, cy * res + res / 2 - sy) >= self.bs_exclusion_m
             if not ok.any():
                 raise ValueError("no field ground outside the base-station exclusion zone; shrink bs_exclusion_m")
             _, self._ugv_site_idx = distance_transform_edt(~ok, return_indices=True)
@@ -742,10 +776,12 @@ class sim_env:
         centroids = self._ugv_sites(k_means.cluster_centers_)
         labels = np.full(self.total_sensors, -1)
         labels[ugv_idx] = k_means.labels_
-        labels[bs_members] = K                               # base-station cluster (if any)
+        for j, m in enumerate(bs_members):                   # base-station clusters (if any)
+            labels[m] = K + j
         sensor_pts = all_pts
-        self.total_clusterheads = K + int(self.base_station)
-        print(f"Placing {K} Cluster Heads" + (" + 1 Base Station" if self.base_station else ""))
+        nb = len(self.bs_sites) if self.base_station else 0
+        self.total_clusterheads = K + nb
+        print(f"Placing {K} Cluster Heads" + (f" + {nb} Base Station" + ("s" if nb > 1 else "") if nb else ""))
 
         ch_list = []
         for index, cluster in enumerate(centroids):
@@ -762,14 +798,17 @@ class sim_env:
                              for i in members]
             ch_list.append(ch)
         if self.base_station:
-            bx_, by_ = int(round(self.bs_xy[0])), int(round(self.bs_xy[1]))
-            lat, long = self.latlong(bx_, by_)
-            bs = devices_iot.BaseStation(self, bx_, by_, long, lat, [sensor_list[i] for i in bs_members], K)
-            bs.sensor_los = [self.line_of_sight(sensor_pts[i][0], sensor_pts[i][1], bx_, by_) for i in bs_members]
-            ch_list.append(bs)
-            centroids = np.vstack([centroids, [bx_, by_]])
-            for ch in ch_list:                               # trip to the guaranteed charger
-                ch.charger_m = 0.0 if ch.is_base else math.hypot(ch.id_x - bx_, ch.id_y - by_)
+            for j, (sx, sy) in enumerate(self.bs_sites):
+                bx_, by_ = int(round(sx)), int(round(sy))
+                lat, long = self.latlong(bx_, by_)
+                mem = bs_members[j]
+                bs = devices_iot.BaseStation(self, bx_, by_, long, lat, [sensor_list[i] for i in mem], K + j)
+                bs.sensor_los = [self.line_of_sight(sensor_pts[i][0], sensor_pts[i][1], bx_, by_) for i in mem]
+                ch_list.append(bs)
+                centroids = np.vstack([centroids, [bx_, by_]])
+            bases = [(c.id_x, c.id_y) for c in ch_list if c.is_base]
+            for ch in ch_list:                               # trip to the nearest guaranteed charger
+                ch.charger_m = 0.0 if ch.is_base else min(math.hypot(ch.id_x - x, ch.id_y - y) for x, y in bases)
 
         uav_list = []
         for count in range(self.total_uav):

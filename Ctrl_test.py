@@ -87,8 +87,17 @@ Rewards (the paper's equations, fleet view): every minute
   correlation ~0.3), plus its own R_chg. --credit team gives every UAV the fleet reward. Logged and evaluated
   rewards are always the fleet (team) values.
 
-Baselines (always evaluated): greedy (highest AoI minus flight time), random sequence and rotation, each with
-  the rule-based dynamic charging and the same shield: the behaviour policies the data was collected with.
+Baselines (always evaluated), each with the rule-based dynamic charging and the same shield:
+  greedy        highest AoI minus flight time, skipping chargers another UAV is heading to, read from the
+                simulator (every UAV's destination, with no radio): the behaviour policy the data was collected with
+  greedy_heard  the same rule on UAV-local knowledge only: its own (or relayed) AoI estimates, skipping only the
+                destinations it has heard over PLoRa within --intent-min, and announcing its own choice to the UAVs
+                it is linked with, as the controller does (the fair baseline)
+  random, rotation  the other two behaviour policies
+
+Privileged upper bound (memory arm oracle+<arm>, e.g. oracle+none): the same controller, trained and evaluated the
+  same way, but every UAV knows the true state of every charger and every UAV's destination each minute (no
+  radio range, no line of sight, no staleness). It bounds what better knowledge could buy in this scenario.
 
 Outputs (in --ctrl-out, default <out>/controller)
   models/vision.pkl, models/mem_<arm>_s<seed>.pt      frozen V and M
@@ -124,7 +133,8 @@ M = L.M
 V = M.V
 
 CHARGE_SETS = {"duration": [0, 5, 10, 15, 20], "binary": [0, 20]}
-BASELINES = ("greedy", "random", "rotation")
+BASELINES = ("greedy", "greedy_heard", "random", "rotation")
+ORACLE = "oracle+"                                         # arm prefix: the privileged upper-bound controller
 DEFAULT_MEMORIES = ["none", "lstm", "lstm_diss@0.97", "ren@0.97", "attn", "lren@0.97g30", "lren@0.97g100"]
 TRAIN_WORLD_BASE, VAL_WORLD_BASE, EVAL_WORLD_BASE = 200_000, 800_000, 900_000   # data: seed_base (1000) + episode
 AOI_SAT = 120.0                                            # Eq. (19): AoI_sat
@@ -132,7 +142,7 @@ METRICS = ["r_tgt", "r_chg", "peak_aoi", "avg_aoi", "data_mb", "deaths", "ugv_ou
            "decisions", "charge_min", "ms_decision", "ms_wm_step"]
 CTRL_KEYS = ("k_token", "k_map", "linear_map", "h_dim", "warm_start", "bc_episodes", "bc_epochs", "teacher_soc",
              "ugv_penalty", "credit", "gamma", "lam", "clip", "ppo_epochs", "minibatch", "lr", "ent", "vcoef",
-             "ctrl_hidden", "train_episodes", "episodes_per_iter", "val_worlds", "val_every")
+             "ctrl_hidden", "train_episodes", "episodes_per_iter", "val_worlds", "val_every", "near_ch")
 MEM_KEYS = ("hidden", "ren_state", "ren_neurons", "attn_window", "attn_dim", "attn_heads", "attn_layers", "attn_c",
             "penalty", "mixtures", "mem_epochs", "mem_patience", "mem_batch", "mem_lr", "dock_m", "map_max_train",
             "lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "token_every", "history",
@@ -180,6 +190,9 @@ def parse(argv=None):
     p.add_argument("--val-worlds", type=int, default=8, help="held-out worlds for picking the best checkpoint")
     p.add_argument("--val-every", type=int, default=60, help="training episodes between validations")
     p.add_argument("--eval-worlds", type=int, default=30)
+    p.add_argument("--near-ch", default="0",
+                   help="destinations a UAV may choose: its N nearest chargers (an integer), 'auto' = ceil(7 x "
+                        "chargers per UAV), 0 = all chargers. The world model still tracks every charger")
     p.add_argument("--dest-max-train", type=int, default=300_000, help="pairs for the destination predictor")
     p.add_argument("--quick", action="store_true", help="tiny settings to check the pipeline end to end")
     a, rest = ap.parse_known_args(argv)
@@ -226,7 +239,7 @@ def cmd_fit(a, b):
     os.makedirs(mdir, exist_ok=True)
     V.check_config(os.path.join(a.ctrl_out, "fit_config.json"), argparse.Namespace(**{**vars(b), **vars(a)}),
                    ("k_token", "k_map", "linear_map") + MEM_KEYS, "fitted V and M")
-    mems = [m for m in a.memories if m != "none"]
+    mems = list(dict.fromkeys(base_arm(m) for m in a.memories if base_arm(m) != "none"))
     todo = [(m, s) for m in mems for s in range(a.seeds)
             if not os.path.exists(os.path.join(mdir, f"mem_{m}_s{s}.pt"))]
     backfill = [(m, s) for m in mems for s in range(a.seeds) if (m, s) not in todo and
@@ -432,6 +445,7 @@ def h_stats(m, D):
 
 
 def h_width(a, mem, seed):
+    mem = base_arm(mem)
     if mem == "none":
         return 0
     n = len(torch.load(os.path.join(a.ctrl_out, "models", f"mem_{mem}_s{seed}.pt"), weights_only=False)["h_mu"])
@@ -588,14 +602,15 @@ class CtrlAgent:
     The first call of a visit decides (destination, charge) from this UAV's world model only; later calls in that
     visit return the commitment."""
 
-    def __init__(s, net, wm, charges, sample, dest=None):
-        s.net, s.wm, s.charges, s.sample, s.dest = net, wm, charges, sample, dest
+    def __init__(s, net, wm, charges, sample, dest=None, near="0"):
+        s.net, s.wm, s.charges, s.sample, s.dest, s.near = net, wm, charges, sample, dest, near
         s.uav, s.commit, s.records, s.dec_time = None, {}, [], 0.0
 
     def start(s, chs, uavs, is_base, t_ref, know):
         s.chs, s.uavs, s.is_base, s.t_ref, s.know = chs, uavs, is_base, t_ref, know
         s.K = len(chs)
         s.xy = np.array([(c.id_x, c.id_y) for c in chs], float)
+        s.allowed = near_mask(s.xy, len(uavs), s.near)
 
     def features(s, i, here):
         """For every charger, UAV i's world model output: [z, z_map, h, forecast share of the other UAVs heading
@@ -605,8 +620,7 @@ class CtrlAgent:
         known = (s.know.ref[i] > -10_000.0) | s.is_base
         occ = dest_occupancy(s.dest, z, s.know.peers(t)[i], i, s.xy / wm.dim)
         F = np.concatenate([z, wm.zm * known[:, None], wm.h[i], occ[:, None]], 1).astype(np.float32)
-        mask = np.ones(s.K, bool)
-        mask[here] = False
+        mask = s.allowed[here].copy()
         return F, mask
 
     def decide(s, F, mask, here):
@@ -653,8 +667,8 @@ class TeacherAgent(CtrlAgent):
     heading to; charge when the leg there would leave less than
     --teacher-soc %, unless the UAV's own reading of this UGV is at or below 20 %."""
 
-    def __init__(s, wm, charges, teacher_soc, dest):
-        super().__init__(None, wm, charges, False, dest)
+    def __init__(s, wm, charges, teacher_soc, dest, near="0"):
+        super().__init__(None, wm, charges, False, dest, near)
         s.teacher_soc = teacher_soc
 
     def act(s, state):
@@ -689,22 +703,90 @@ class BaselineAgent:
     def __init__(s, kind):
         s.kind, s.records, s.dec_time, s.uav = kind, [], 0.0, None
 
-    def make(s, chs, uavs, rng):
+    def make(s, chs, uavs, rng, know=None, t_ref=None):
         from sim_mods import ablation
-        s.pol = V.VisitPolicy(s.kind, chs, uavs, rng, ablation.UAV_SPEED)
+        s.chs, s.uavs, s.know, s.t_ref, s.speed = chs, uavs, know, t_ref, ablation.UAV_SPEED
+        s.pol = V.VisitPolicy("greedy" if s.kind == "greedy_heard" else s.kind, chs, uavs, rng, ablation.UAV_SPEED)
 
     def act(s, state):
-        s.pol.uav = s.uav
         t0 = time.perf_counter()
-        r = s.pol.act(state)
+        if s.kind == "greedy_heard":
+            r = s.heard(s.uav)
+        else:
+            s.pol.uav = s.uav
+            r = s.pol.act(state)
         s.dec_time += time.perf_counter() - t0
         return r
+
+    def heard(s, u):
+        """Greedy on UAV-local knowledge (see the module notes): own/relayed AoI estimate minus flight minutes,
+        skipping the destinations heard within --intent-min; the choice is announced like the controller's."""
+        k, t, K = s.know, s.t_ref[0], len(s.chs)
+        i = s.uavs.index(u)
+        here = u.target.cluster_num if u.target is not None and u.target.type == 2 else -1
+        claimed = {int(k.intent[i, j]) for j in range(len(s.uavs))
+                   if j != i and k.intent[i, j] >= 0 and t - k.intent_t[i, j] <= k.intent_min}
+        best, best_s = (here + 1) % K, -1e18
+        for c, ch in enumerate(s.chs):
+            if c == here or c in claimed:
+                continue
+            sc = k.estP[i, c] - math.hypot(ch.id_x - u.id_x, ch.id_y - u.id_y) / (s.speed * 60)
+            if sc > best_s:
+                best, best_s = c, sc
+        k.announce(i, best, t)
+        return best
+
+
+class OracleKnowledge(V.UAVKnowledge):
+    """Privileged knowledge for the upper-bound arms (oracle+<arm>): every minute every UAV holds the true battery
+    of every charger, the fleet's freshest AoI, every shortfall any UAV met, and every UAV's true destination,
+    position and battery (as if all UAVs were always linked). Same arrays and outputs as UAVKnowledge."""
+
+    def update(s, t, dead, age):
+        U, K = len(s.uavs), len(s.chs)
+        s.ref[:] = t
+        s.soc[:] = np.array([100.0 if s.base[c] else ch.stored_energy for c, ch in enumerate(s.chs)])[None]
+        for i, u in enumerate(s.uavs):
+            if dead[i]:
+                continue
+            tg = u.target
+            if u.short_minutes > s.short_seen[i] and tg is not None and tg.type == 2:
+                s.short[:, tg.cluster_num] = t
+            s.short_seen[i] = u.short_minutes
+        P, A = s.own_aoi(age)
+        s.estP, s.estA = np.repeat(P.min(0)[None], U, 0), np.repeat(A.min(0)[None], U, 0)
+        s.rel_peak, s.rel_avg = s.estP.copy(), s.estA.copy()
+        for j, u in enumerate(s.uavs):
+            s.intent[:, j] = u.targetHead.cluster_num if (not dead[j] and u.targetHead is not None) else -1
+            s.intent_t[:, j] = t
+            s.kpos[:, j] = (u.id_x, u.id_y)
+            s.kbatt[:, j] = u.state[0][2]
+        s.adj[:] = ~np.eye(U, dtype=bool) & ~dead[None, :] & ~dead[:, None]
+        for i, u in enumerate(s.uavs):
+            u.known_soc = {c: s.soc[i, c] for c in range(K)}
+
+
+def near_mask(xy, n_uav, near):
+    """(K, K) bool: row c = the destinations allowed from charger c (its N nearest other chargers)."""
+    K = len(xy)
+    if str(near) in ("0", "", "all", "None"):
+        N = K - 1
+    elif str(near) == "auto":
+        N = int(math.ceil(7.0 * K / max(n_uav, 1)))
+    else:
+        N = int(near)
+    N = max(1, min(N, K - 1))
+    D = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+    np.fill_diagonal(D, np.inf)
+    out = np.zeros((K, K), bool)
+    out[np.arange(K)[:, None], np.argsort(D, 1)[:, :N]] = True
+    return out
 
 
 # ==============================================================================================
 # One episode in a new world
 # ==============================================================================================
-def run_world(world_seed, b, agent, wm=None):
+def run_world(world_seed, b, agent, wm=None, oracle=False):
     """Mirrors VAE_test.run_episode (same resets, same order of simulator calls, same fleet observation) with the
     agent choosing destinations. Returns per-minute rewards, the agent's records and episode metrics."""
     from sim_mods import ablation
@@ -742,13 +824,13 @@ def run_world(world_seed, b, agent, wm=None):
     cluster_size = np.bincount(cluster, minlength=K).astype(np.float32)
     charger_m = np.array([getattr(ch, "charger_m", 0.0) for ch in chs], np.float32)
     t_ref = [0]
-    know = V.UAVKnowledge(env, chs, uavs, T, b.uav_alt, b.plora_m, b.intent_min)   # what each UAV knows (as collected)
+    know = (OracleKnowledge if oracle else V.UAVKnowledge)(env, chs, uavs, T, b.uav_alt, b.plora_m, b.intent_min)
     if wm is not None:
         wm.start(env, chs, uavs, info["doy"], T, cluster_size, charger_m, len(V.CH_FEATS))
     if isinstance(agent, CtrlAgent):
         agent.start(chs, uavs, is_base, t_ref, know)
     else:
-        agent.make(chs, uavs, ep_rng)
+        agent.make(chs, uavs, ep_rng, know, t_ref)
     power = V.NullPower()
 
     last_contact = np.full(K, -10_000.0)
@@ -856,9 +938,15 @@ def run_world(world_seed, b, agent, wm=None):
 _W = {}
 
 
-def _init_worker(ctrl_out, mem, seed, charging, b, hidden, h_dim=0):
+def base_arm(mem):
+    """oracle+<arm> -> <arm> (the memory model it uses)."""
+    return mem[len(ORACLE):] if mem and mem.startswith(ORACLE) else mem
+
+
+def _init_worker(ctrl_out, mem, seed, charging, b, hidden, h_dim=0, near="0"):
     torch.set_num_threads(1)
-    _W.update(b=b, charges=CHARGE_SETS.get(charging))
+    _W.update(b=b, charges=CHARGE_SETS.get(charging), oracle=bool(mem and mem.startswith(ORACLE)), near=near)
+    mem = base_arm(mem)
     if mem is None:
         return
     vis = pickle.load(open(os.path.join(ctrl_out, "models", "vision.pkl"), "rb"))
@@ -880,11 +968,12 @@ def _rollout(job):
     with contextlib.redirect_stdout(io.StringIO()):            # the simulator prints
         if kind == "ctrl":
             _W["net"].load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
-            agent = CtrlAgent(_W["net"], _W["wm"], _W["charges"], sample, _W["dest"])
+            agent = CtrlAgent(_W["net"], _W["wm"], _W["charges"], sample, _W["dest"], _W["near"])
             torch.manual_seed(world)
-            out = run_world(world, _W["b"], agent, _W["wm"])
+            out = run_world(world, _W["b"], agent, _W["wm"], _W["oracle"])
         elif kind == "teacher":                                # weights = --teacher-soc here
-            out = run_world(world, _W["b"], TeacherAgent(_W["wm"], _W["charges"], weights, _W["dest"]), _W["wm"])
+            out = run_world(world, _W["b"], TeacherAgent(_W["wm"], _W["charges"], weights, _W["dest"], _W["near"]),
+                            _W["wm"], _W["oracle"])
         else:
             out = run_world(world, _W["b"], BaselineAgent(kind))
     out["world"] = world
@@ -894,7 +983,7 @@ def _rollout(job):
 def pool(a, mem, seed, charging, b):
     import multiprocessing as mp
     return ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
-                               initargs=(a.ctrl_out, mem, seed, charging, b, a.ctrl_hidden, a.h_dim))
+                               initargs=(a.ctrl_out, mem, seed, charging, b, a.ctrl_hidden, a.h_dim, a.near_ch))
 
 
 # ==============================================================================================
@@ -1160,8 +1249,9 @@ def cmd_report(a, b):
     paired = []
     ctrl = d[~d.arm.isin(BASELINES)]
     greedy = d[d.arm == "greedy"].set_index("world")
+    heard = d[d.arm == "greedy_heard"].set_index("world")
     for (arm, ch), g in ctrl.groupby(["arm", "charging"], sort=False):
-        refs = [("greedy", greedy)]
+        refs = [("greedy", greedy)] + ([("greedy_heard", heard)] if len(heard) else [])
         lstm = ctrl[(ctrl.arm == "lstm") & (ctrl.charging == ch)].set_index(["seed", "world"])
         if arm != "lstm" and len(lstm):
             refs.append(("lstm", lstm))
@@ -1170,7 +1260,7 @@ def cmd_report(a, b):
                 diffs = []
                 for s, gs in g.groupby("seed"):
                     gs = gs.set_index("world")
-                    rv = ref[k] if name == "greedy" else ref.loc[s][k] if s in ref.index.get_level_values(0) else None
+                    rv = ref[k] if name.startswith("greedy") else ref.loc[s][k] if s in ref.index.get_level_values(0) else None
                     if rv is None:
                         continue
                     common = gs.index.intersection(rv.index)
