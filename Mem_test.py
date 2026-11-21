@@ -75,6 +75,10 @@ def parse(argv=None):
     ap.add_argument("--mem-batch", type=int, default=32)
     ap.add_argument("--mem-lr", type=float, default=1e-3)
     ap.add_argument("--dock-m", type=float, default=50.0, help="a UAV this close to the UGV counts as docked")
+    ap.add_argument("--max-seqs", type=int, default=MAX_SEQS,
+                    help="cap on day-long token-row sequences loaded for training (half that for validation and "
+                         "test), spread evenly over episodes; larger farms have many more (UAV, UGV) rows per "
+                         "episode. The 36 km2 farm has fewer than this, so it is unaffected")
     ap.add_argument("--rollout", type=int, nargs="+", default=[6, 12], help="dream horizons in steps")
     ap.add_argument("--map-max-train", type=int, default=None, help="cap on map patches for the map VAE")
     ap.add_argument("--map-max-epochs", type=int, default=None, help="epoch cap for the map VAE")
@@ -116,16 +120,25 @@ def episode_sequences(f, a, b):
     return X.astype(np.float64), Y.astype(np.float64), A.astype(np.float64), P, Mk
 
 
+MAX_SEQS = 40_000
+
+
 def load_sequences(a, b):
     files = sorted(V.glob.glob(os.path.join(a.out, "data", "ep_*.npz")))
     parts = V.split_episodes(files, b)
     mu, sd = b._ch_stats
     mmu, msd = b._map_stats
     out = {}
+    cap = getattr(a, "max_seqs", MAX_SEQS)
     for name, fs in zip(("train", "val", "test"), parts):
         Xs, Ys, As, Ps, Ms = [], [], [], [], []
+        per_ep = int(math.ceil((cap if name == "train" else cap // 2) / max(len(fs), 1)))
         for f in fs:
             X, Y, A, P, Mk = episode_sequences(f, a, b)
+            if len(X) > per_ep:                              # large farms: an even, seeded sample of rows
+                keep = np.sort(np.random.default_rng(V.episode_id(f)).choice(len(X), per_ep, replace=False))
+                X, Y, A, P = X[keep], Y[keep], A[keep], P[keep]
+                Mk = None if Mk is None else Mk[keep]
             Ms.append(Mk)
             Xs.append(np.clip((X - mu) / sd, -b.z_clip, b.z_clip))
             Ys.append(Y)
@@ -416,7 +429,7 @@ def cmd_run(a, b):
     os.makedirs(a.mem_out, exist_ok=True)
     V.check_config(os.path.join(a.mem_out, "memory_config.json"), argparse.Namespace(**{**vars(b), **vars(a)}),
                    ("k_token", "k_map", "hidden", "mixtures", "mem_epochs", "mem_patience", "mem_batch", "mem_lr",
-                    "dock_m", "rollout", "map_max_train", "map_max_epochs", "max_train", "max_epochs", "patience",
+                    "dock_m", "rollout", "map_max_train", "map_max_epochs", "max_train", "max_epochs", "patience", "max_seqs",
                     "token_every", "history", "history_stride", "z_clip", "beta", "kl_tol"), "memory results")
     linear = a.linear_maps or default_linear(a)
     print(f"linear configurations: token PCA + map {linear}; compared with token VAE + map VAE "
