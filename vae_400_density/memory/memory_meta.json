@@ -1,0 +1,1 @@
+{"linear":["dct","pca","db2"],"onset":{"train":153383,"val":77092,"test":73755},"sequences":{"train":40020,"val":20064,"test":20064},"steps":144}

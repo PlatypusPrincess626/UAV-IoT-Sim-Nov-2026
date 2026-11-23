@@ -1,0 +1,7 @@
+{
+ "lren_state": 256,
+ "lren_neurons": 256,
+ "lren_head": "mix",
+ "lren_epochs": 120,
+ "lren_patience": 12
+}
