@@ -145,7 +145,8 @@ CTRL_KEYS = ("k_token", "k_map", "linear_map", "h_dim", "warm_start", "bc_episod
              "ctrl_hidden", "train_episodes", "episodes_per_iter", "val_worlds", "val_every", "near_ch")
 MEM_KEYS = ("hidden", "ren_state", "ren_neurons", "attn_window", "attn_dim", "attn_heads", "attn_layers", "attn_c",
             "penalty", "mixtures", "mem_epochs", "mem_patience", "mem_batch", "mem_lr", "dock_m", "map_max_train",
-            "lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "token_every", "history",
+            "lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "lren_mse", "lren_dream",
+            "lren_dream_w", "lren_select", "lren_init", "token_every", "history",
             "history_stride", "z_clip")
 
 

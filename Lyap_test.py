@@ -100,6 +100,20 @@ def parse(argv=None):
                     help="mix: mixture weights depend on the state (mean still certified); const: learned constants")
     ap.add_argument("--lren-epochs", type=int, default=120)
     ap.add_argument("--lren-patience", type=int, default=12)
+    g = ap.add_argument_group("lren training (none of these touch the certificate; defaults = the original runs)")
+    g.add_argument("--lren-mse", type=float, default=0.0,
+                   help="weight on the squared error of the certified mean y (standardised latent units), added to "
+                        "the mixture NLL. NLL alone lets the free mixture offsets absorb the fit while y lags")
+    g.add_argument("--lren-dream", type=int, default=0,
+                   help="multi-step loss: per batch, unroll this many steps from a random start feeding back the "
+                        "predicted mean (as in the dream test) and penalise its squared error. 0 = off; 12 = 1 h")
+    g.add_argument("--lren-dream-w", type=float, default=10.0, help="weight on the multi-step loss (only used with --lren-dream)")
+    g.add_argument("--lren-select", default="nll", choices=("nll", "fvu", "dream"),
+                   help="validation score for early stopping and the kept checkpoint: mixture NLL; next-step squared "
+                        "error of the mean; or squared error of 12-step dreams of the mean (what the 10%% goal measures)")
+    g.add_argument("--lren-init", default="random", choices=("random", "slow"),
+                   help="slow: start the state matrix near the certified rate (slow decay, long memory) instead of "
+                        "random weights, which start it near zero (forgets within a few steps)")
     ap.add_argument("--rates", type=float, nargs="+", default=[0.9, 0.97, 0.99],
                     help="certified contraction rates for lstm_diss and ren (per 5-minute step)")
     ap.add_argument("--seeds", type=int, default=9)
@@ -406,6 +420,28 @@ class LRENMemory(Memory):
             s.pi = nn.Parameter(torch.zeros(dz, a.mixtures))
         s.register_buffer("tau", torch.tensor(1.0))    # nu = nu_min (1 + 1e-4) + tau, tau re-chosen every 50 steps
         s._cache, s._steps = None, 0
+        if getattr(a, "lren_init", "random") == "slow":
+            s.slow_init()
+
+    @torch.no_grad()
+    def slow_init(s, frac=0.98, noise=0.05):
+        """Choose X so that H = X'X + eps I has H11 = P = I, H22 = I, F = rho E with E = (1/r^2 + 1)/2 I, so the
+        state matrix starts at A = E^-1 F = rho I: every direction decays at rho per step. H stays positive
+        definite (the certificate holds for every X anyway) when |F| < 1, i.e. rho < 2 r^2 / (1 + r^2); rho is set
+        to frac of that limit (about 0.95 for r = 0.97). Small random cross terms let the neurons and inputs
+        couple from the start."""
+        n, q = s.n, s.q
+        m = 2 * n + q
+        e = 0.5 * (1.0 / s.rate ** 2 + 1.0)
+        rho = frac * 2 * s.rate ** 2 / (1 + s.rate ** 2)
+        Ht = torch.eye(m)
+        Ht[n + q:, :n] = rho * e * torch.eye(n)
+        Ht[:n, n + q:] = rho * e * torch.eye(n)
+        R = noise * torch.randn(m, m) / math.sqrt(m)
+        Ht = Ht + R @ R.T                                    # stays positive definite
+        Ht = Ht - 1e-3 * torch.eye(m)                        # blocks() adds 1e-3 I back
+        s.X.copy_(torch.linalg.cholesky(Ht).T)
+        s.init_rho = rho
 
     def train(s, mode=True):
         s._cache = None
@@ -633,16 +669,33 @@ def train(arm, seed, D, a, b):
     m = build(arm, din, dz, a, R).to(dev)
     m.project()
     opt = torch.optim.Adam(m.parameters(), lr=a.mem_lr)
-    epochs, patience = (a.lren_epochs, a.lren_patience) if arm.startswith("lren") else (a.mem_epochs, a.mem_patience)
+    is_lren = arm.startswith("lren")
+    epochs, patience = (a.lren_epochs, a.lren_patience) if is_lren else (a.mem_epochs, a.mem_patience)
+    w_mse = getattr(a, "lren_mse", 0.0) if is_lren else 0.0
+    K = getattr(a, "lren_dream", 0) if is_lren else 0
+    w_dream = getattr(a, "lren_dream_w", 10.0)
+    select = getattr(a, "lren_select", "nll") if is_lren else "nll"
     Xi, Zt = torch.tensor(tr["inp"][:, :-1]), torch.tensor(tr["zs"][:, 1:].astype(np.float32))
+    Xf, Zf = torch.tensor(tr["inp"]), torch.tensor(tr["zs"].astype(np.float32))
     Vi, Vz = torch.tensor(va["inp"][:, :-1]).to(dev), torch.tensor(va["zs"][:, 1:].astype(np.float32)).to(dev)
+    if select == "dream":                                  # fixed validation subset, so scores are comparable
+        vsel = np.sort(np.random.default_rng(1234).choice(len(va["inp"]), min(2048, len(va["inp"])), replace=False))
+        Vdi, Vdz = torch.tensor(va["inp"][vsel]), torch.tensor(va["zs"][vsel].astype(np.float32))
     g = torch.Generator().manual_seed(seed)
+    gs = np.random.default_rng(seed + 777)
+    T = Xf.shape[1]
     best, best_state, bad = float("inf"), None, 0
     for ep in range(epochs):
         m.train()
         for idx in torch.randperm(len(Xi), generator=g).split(a.mem_batch):
             _, _, lp, mu, ls = m(Xi[idx].to(dev))
-            loss = m.nll(lp, mu, ls, Zt[idx].to(dev))
+            tgt = Zt[idx].to(dev)
+            loss = m.nll(lp, mu, ls, tgt)
+            if w_mse > 0:                                  # the mixture mean IS the certified output y
+                loss = loss + w_mse * ((m.mean(lp, mu) - tgt) ** 2).mean()
+            if K > 0:
+                t0 = int(gs.integers(1, T - K))
+                loss = loss + w_dream * dream_mse(m, Xf[idx].to(dev), Zf[idx].to(dev), t0, K)
             pen = m.penalty()
             if pen is not None:
                 loss = loss + pen
@@ -653,9 +706,21 @@ def train(arm, seed, D, a, b):
             m.project()                                     # keeps the certificate after every step
         m.eval()
         with torch.no_grad():
-            vl = float(sum(m.nll(*m(Vi[i:i + 64])[2:], Vz[i:i + 64]) * len(Vi[i:i + 64])
-                           for i in range(0, len(Vi), 64)) / len(Vi))
-        if vl < best - 1e-4:
+            if select == "nll":
+                vl = float(sum(m.nll(*m(Vi[i:i + 64])[2:], Vz[i:i + 64]) * len(Vi[i:i + 64])
+                               for i in range(0, len(Vi), 64)) / len(Vi))
+            elif select == "fvu":
+                vl = float(sum(((pred(m, Vi[i:i + 64]) - Vz[i:i + 64]) ** 2).mean() * len(Vi[i:i + 64])
+                               for i in range(0, len(Vi), 64)) / len(Vi))
+            else:                                          # 12-step dreams from every 12th step, latent space
+                tot, cnt = 0.0, 0
+                for i in range(0, len(Vdi), 256):
+                    x, z = Vdi[i:i + 256].to(dev), Vdz[i:i + 256].to(dev)
+                    for t0 in range(12, T - 12, 12):
+                        tot += float(dream_mse(m, x, z, t0, 12)) * len(x)
+                        cnt += len(x)
+                vl = tot / cnt
+        if vl < best - 1e-4 * (1 if select == "nll" else 0.01):
             best, bad = vl, 0
             best_state = {k: v.detach().clone() for k, v in m.state_dict().items()}
         else:
@@ -664,8 +729,29 @@ def train(arm, seed, D, a, b):
                 break
     m.load_state_dict(best_state)
     m.eval()
+    if select != "nll":                                    # keep val_nll meaning the NLL, whatever selected
+        with torch.no_grad():
+            best_score, best = best, float(sum(m.nll(*m(Vi[i:i + 64])[2:], Vz[i:i + 64]) * len(Vi[i:i + 64])
+                                               for i in range(0, len(Vi), 64)) / len(Vi))
+        m.val_select = best_score
     m.epochs, m.val_nll = ep + 1, best
     return m
+
+
+def dream_mse(m, x, z, t0, K):
+    """Squared error of a K-step dream of the predicted mean: teacher-forced up to t0, then each step's latent
+    input is the previous prediction (the map and action inputs stay true, as in Mem_test's dream test).
+    x (B, T, din) inputs with x[:, t, :dz] = z_t; z (B, T, dz) targets. Predicts z_{t0+1} .. z_{t0+K}."""
+    dz = z.shape[2]
+    _, st, lp, mu, _ = m(x[:, :t0 + 1])
+    zh = m.mean(lp[:, -1:], mu[:, -1:])
+    err = ((zh - z[:, t0 + 1:t0 + 2]) ** 2).mean()
+    for j in range(1, K):
+        step = torch.cat([zh, x[:, t0 + j:t0 + j + 1, dz:]], 2)
+        _, st, lp, mu, _ = m(step, st)
+        zh = m.mean(lp, mu)
+        err = err + ((zh - z[:, t0 + j + 1:t0 + j + 2]) ** 2).mean()
+    return err / K
 
 
 # ----------------------------------------------------------------------------------------------
@@ -782,7 +868,8 @@ def prepare(tok, mapc, S, a):
 def run_arm(arm, seed, a, b, D, zstats, tok, S):
     t0 = time.time()
     m = train(arm, seed, D, a, b)
-    row = dict(arm=arm, seed=seed, epochs=m.epochs, val_nll=m.val_nll)
+    row = dict(arm=arm, seed=seed, epochs=m.epochs, val_nll=m.val_nll, val_select=getattr(m, "val_select", m.val_nll),
+               init_rho=getattr(m, "init_rho", float("nan")))
     feats = {}
     for name in ("train", "val", "test"):
         r, Hh = M.evaluate(m, D[name], tok, zstats, a, b, dreams=name != "train")
@@ -895,7 +982,8 @@ def cmd_run(a, b):
     arms = arm_list(a)
     if any(x.startswith("lren") for x in arms):     # own file, so lren can be added to an existing results folder
         V.check_config(os.path.join(a.lyap_out, "lyap_config_lren.json"), a,
-                       ("lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience"), "lren results")
+                       ("lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "lren_mse",
+                        "lren_dream", "lren_dream_w", "lren_select", "lren_init"), "lren results")
     print(f"vision: token PCA ({a.k_token}) + map {lin} ({a.k_map}), frozen and 8-bit; memory arms: {arms}", flush=True)
     ch = V.load_track("ch", b)
     mt = b.max_train
