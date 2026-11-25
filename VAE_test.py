@@ -616,7 +616,7 @@ RUN_KEYS = ("n_episodes", "val_frac", "test_frac", "history", "history_stride", 
             "max_probe", "max_epochs", "patience", "batch", "lr", "beta", "kl_tol")
 
 
-LEGACY = {"lren_mse": 0.0, "lren_dream": 0, "lren_dream_w": 10.0, "lren_select": "nll", "lren_init": "random", "knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0,
+LEGACY = {"lren_ema": [], "lren_mse": 0.0, "lren_dream": 0, "lren_dream_w": 10.0, "lren_select": "nll", "lren_init": "random", "knowledge": "fleet", "uav_alt": 60.0, "plora_m": 5000.0, "intent_min": 30.0, "supply_margin": 0.0,
           "satellite_docks": 0, "scale": "none", "ch_scale": "area", "near_ch": "0", "max_seqs": 40_000}   # what a folder made before these settings existed used
 
 

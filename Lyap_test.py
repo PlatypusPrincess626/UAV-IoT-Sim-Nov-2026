@@ -111,6 +111,11 @@ def parse(argv=None):
     g.add_argument("--lren-select", default="nll", choices=("nll", "fvu", "dream"),
                    help="validation score for early stopping and the kept checkpoint: mixture NLL; next-step squared "
                         "error of the mean; or squared error of 12-step dreams of the mean (what the 10%% goal measures)")
+    g.add_argument("--lren-ema", type=float, nargs="*", default=[],
+                   help="long memory with an exact certificate: half-lives (in steps; 12 = 1 h) of fixed moving averages "
+                        "of the token, fed to the REN as extra inputs, e.g. 6 12 36. Each average moves at most as much "
+                        "as the token, so the certified gain grows by sqrt(1 + number of averages), and the REN input is "
+                        "scaled so the total stays <= gamma. The averages are part of the memory state (and features)")
     g.add_argument("--lren-init", default="random", choices=("random", "slow"),
                    help="slow: start the state matrix near the certified rate (slow decay, long memory) instead of "
                         "random weights, which start it near zero (forgets within a few steps)")
@@ -402,7 +407,15 @@ class LRENMemory(Memory):
     def __init__(s, din, dz, a, rate, gamma):
         super().__init__()
         n, q = a.lren_state, a.lren_neurons
+        hl = [float(h) for h in (getattr(a, "lren_ema", None) or [])]
+        s.ne = len(hl)                                       # moving averages of the token z (first dz inputs)
+        s.register_buffer("ema_a", torch.tensor([0.5 ** (1.0 / h) for h in hl], dtype=torch.float32))
+        s.ema_gain = math.sqrt(1 + s.ne)                     # per-step |du| <= sqrt(1 + ne) |dx|: see forward
+        s.ns = n + s.ne * dz + s.ne                          # full state: REN x, averages f, weight sums c
+        din_x = din
+        din = din + s.ne * dz                                # REN input: [x, normalised averages]
         s.n, s.q, s.din, s.dz, s.K = n, q, din, dz, a.mixtures
+        s.din_x = din_x
         s.rate, s.gamma = rate, gamma
         m = 2 * n + q
         s.X = nn.Parameter(torch.randn(m, m) / math.sqrt(m))
@@ -415,7 +428,7 @@ class LRENMemory(Memory):
         s.D22 = nn.Parameter(D22)
         s.bx, s.bv, s.by = nn.Parameter(torch.zeros(n)), nn.Parameter(torch.zeros(q)), nn.Parameter(torch.zeros(dz))
         s.state_head = a.lren_head == "mix"
-        s.aux = nn.Linear(n, (3 if s.state_head else 2) * dz * a.mixtures)
+        s.aux = nn.Linear(s.ns, (3 if s.state_head else 2) * dz * a.mixtures)
         if not s.state_head:
             s.pi = nn.Parameter(torch.zeros(dz, a.mixtures))
         s.register_buffer("tau", torch.tensor(1.0))    # nu = nu_min (1 + 1e-4) + tau, tau re-chosen every 50 steps
@@ -486,7 +499,7 @@ class LRENMemory(Memory):
             return s._cache
         b = s.blocks()
         nu = s.nu_min(b).detach() * (1 + 1e-4) + s.tau
-        alpha = torch.clamp(s.gamma / s.gain(b, nu), max=1.0)
+        alpha = torch.clamp(s.gamma / (s.ema_gain * s.gain(b, nu)), max=1.0)
         Ei = torch.linalg.inv(b["E"])
         out = dict(A=Ei @ b["F"], B1=Ei @ b["B1"], B2=Ei @ s.B2, bx=Ei @ s.bx, C1=b["C1"], alpha=alpha)
         if not s.training:
@@ -508,11 +521,35 @@ class LRENMemory(Memory):
         s._cache = None
 
     # -- forward --------------------------------------------------------------------------------------
+    def averages(s, x, state):
+        """Fixed moving averages of the token z_t = x[..., :dz]: f_t = a f_{t-1} + (1 - a) z_t and the weight sum
+        c_t = a c_{t-1} + (1 - a) (both start at 0). The REN reads fhat = f / c, a convex combination of past
+        tokens whose weights do not depend on the data, so |dfhat_t| <= max_s |dz_s| <= delta per step and the
+        REN input [x, fhat] moves at most sqrt(1 + ne) delta. Returns fhat (B, T, ne*dz) and the stacked
+        state parts (B, T, ne*dz + ne)."""
+        Bn, T, _ = x.shape
+        dz, ne, a = s.dz, s.ne, s.ema_a
+        if state is not None:
+            f = state[:, s.n:s.n + ne * dz].reshape(Bn, ne, dz)
+            c = state[:, s.n + ne * dz:]
+        else:
+            f, c = x.new_zeros(Bn, ne, dz), x.new_zeros(Bn, ne)
+        fh, st = [], []
+        for t in range(T):
+            f = a[None, :, None] * f + (1 - a)[None, :, None] * x[:, t, None, :dz]
+            c = a[None] * c + (1 - a)[None]
+            fh.append((f / c[..., None]).reshape(Bn, -1))
+            st.append(torch.cat([f.reshape(Bn, -1), c], 1))
+        return torch.stack(fh, 1), torch.stack(st, 1)
+
     def forward(s, x, state=None):
         k = s.mats()
-        u = x * k["alpha"]
         Bn, T, _ = x.shape
-        xs = state if state is not None else x.new_zeros(Bn, s.n)
+        if s.ne:
+            fh, est = s.averages(x, state)
+            x = torch.cat([x, fh], 2)
+        u = x * k["alpha"]
+        xs = state[:, :s.n] if state is not None else x.new_zeros(Bn, s.n)
         Du, Bu, Yu = u @ s.D12.T + s.bv, u @ k["B2"].T + k["bx"], u @ s.D22.T + s.by
         hs, ys = [], []
         for t in range(T):
@@ -521,6 +558,9 @@ class LRENMemory(Memory):
             xs = xs @ k["A"].T + w @ k["B1"].T + Bu[:, t]
             hs.append(xs)
         h, y = torch.stack(hs, 1), torch.stack(ys, 1)
+        if s.ne:                                          # the averages are memory too: state = [x, f, c]
+            h = torch.cat([h, est], 2)
+            xs = h[:, -1]
         sh = h.shape[:-1]
         p = s.aux(h).view(*sh, s.dz, -1, s.K)
         logpi = torch.log_softmax(p[..., 2, :], -1) if s.state_head else \
@@ -557,14 +597,20 @@ class LRENMemory(Memory):
             G = torch.cat([b["Gz"], alpha * b["D22"]], 1)
             Psi -= G.T @ G / nu
             pe = torch.linalg.eigvalsh(Psi)
-            s.extra = dict(cert_Lx=math.sqrt(nu) * math.sqrt(float(ev[-1])),
-                           cert_Lh=alpha * math.sqrt(mu / (1 - s.rate ** 2)) / math.sqrt(float(ev[0])),
-                           lmi_min=float(pe[0] / pe.abs().max()), alpha=alpha, gamma=s.gamma)
-            return s.rate, alpha * Lstar, float("nan")
+            Lh = alpha * s.ema_gain * math.sqrt(mu / (1 - s.rate ** 2)) / math.sqrt(float(ev[0]))
+            if s.ne:   # raw averages f move <= delta each (weights sum <= 1); c does not depend on the data
+                Lh = math.sqrt(Lh ** 2 + s.ne)
+            s.extra = dict(cert_Lx=math.sqrt(nu) * math.sqrt(float(ev[-1])), cert_Lh=Lh,
+                           lmi_min=float(pe[0] / pe.abs().max()), alpha=alpha, gamma=s.gamma,
+                           ema_rho=float(s.ema_a.max()) if s.ne else float("nan"))
+            return s.rate, alpha * s.ema_gain * Lstar, float("nan")
 
     def random_state(s, B, dev):
         g = torch.Generator().manual_seed(1)
-        return torch.randn(B, s.n, generator=g).to(dev)
+        x0 = torch.randn(B, s.n, generator=g).to(dev)
+        # averages start equal (zero) in both copies: emp_rho / emp_Lx test the REN state, whose rate is certified;
+        # the averages' own decay is fixed and known (ema_rho)
+        return torch.cat([x0, x0.new_zeros(B, s.ns - s.n)], 1) if s.ne else x0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -920,7 +966,7 @@ def run_arm(arm, seed, a, b, D, zstats, tok, S):
     for k in (0, 12, 48):
         row[f"imp_k{k}"] = float(curve[k]) if k < len(curve) else float("nan")
     row["emp_rho"], row["state_half"] = contraction(m, X)
-    for k in ("cert_Lx", "cert_Lh", "lmi_min", "alpha", "gamma", "emp_Lx", "emp_Lh"):
+    for k in ("cert_Lx", "cert_Lh", "lmi_min", "alpha", "gamma", "emp_Lx", "emp_Lh", "ema_rho"):
         row[k] = getattr(m, "extra", {}).get(k, float("nan"))
     if isinstance(m, LRENMemory):
         row["emp_Lx"], row["emp_Lh"] = state_tests(m, X, a.eps, a.pgd_steps)
@@ -999,7 +1045,7 @@ def cmd_run(a, b):
     if any(x.startswith("lren") for x in arms):     # own file, so lren can be added to an existing results folder
         V.check_config(os.path.join(a.lyap_out, "lyap_config_lren.json"), a,
                        ("lren_state", "lren_neurons", "lren_head", "lren_epochs", "lren_patience", "lren_mse",
-                        "lren_dream", "lren_dream_w", "lren_select", "lren_init"), "lren results")
+                        "lren_dream", "lren_dream_w", "lren_select", "lren_init", "lren_ema"), "lren results")
     print(f"vision: token PCA ({a.k_token}) + map {lin} ({a.k_map}), frozen and 8-bit; memory arms: {arms}", flush=True)
     ch = V.load_track("ch", b)
     mt = b.max_train
