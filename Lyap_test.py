@@ -686,16 +686,20 @@ def train(arm, seed, D, a, b):
     T = Xf.shape[1]
     best, best_state, bad = float("inf"), None, 0
     for ep in range(epochs):
+        t_ep = time.time()
         m.train()
         for idx in torch.randperm(len(Xi), generator=g).split(a.mem_batch):
-            _, _, lp, mu, ls = m(Xi[idx].to(dev))
+            if K > 0:
+                m._cache = m.mats()                        # one set of certified matrices for the whole batch
+            h, _, lp, mu, ls = m(Xi[idx].to(dev))
             tgt = Zt[idx].to(dev)
             loss = m.nll(lp, mu, ls, tgt)
             if w_mse > 0:                                  # the mixture mean IS the certified output y
                 loss = loss + w_mse * ((m.mean(lp, mu) - tgt) ** 2).mean()
-            if K > 0:
+            if K > 0:                                      # continue from the teacher-forced pass: no re-run
                 t0 = int(gs.integers(1, T - K))
-                loss = loss + w_dream * dream_mse(m, Xf[idx].to(dev), Zf[idx].to(dev), t0, K)
+                loss = loss + w_dream * dream_mse(m, Xf[idx].to(dev), Zf[idx].to(dev), t0, K, (h, lp, mu))
+                m._cache = None
             pen = m.penalty()
             if pen is not None:
                 loss = loss + pen
@@ -716,10 +720,16 @@ def train(arm, seed, D, a, b):
                 tot, cnt = 0.0, 0
                 for i in range(0, len(Vdi), 256):
                     x, z = Vdi[i:i + 256].to(dev), Vdz[i:i + 256].to(dev)
+                    full = m(x)                            # one teacher-forced pass, dreams branch off it
+                    full = (full[0], full[2], full[3])
                     for t0 in range(12, T - 12, 12):
-                        tot += float(dream_mse(m, x, z, t0, 12)) * len(x)
+                        tot += float(dream_mse(m, x, z, t0, 12, full)) * len(x)
                         cnt += len(x)
                 vl = tot / cnt
+        if is_lren:
+            print(f"  {arm} seed {seed} epoch {ep + 1}/{epochs}: val {select} {vl:.5f} (best {min(best, vl):.5f}, "
+                  f"{bad if vl >= best - 1e-4 * (1 if select == 'nll' else 0.01) else 0}/{patience} without "
+                  f"improvement)  {time.time() - t_ep:.0f}s", flush=True)
         if vl < best - 1e-4 * (1 if select == "nll" else 0.01):
             best, bad = vl, 0
             best_state = {k: v.detach().clone() for k, v in m.state_dict().items()}
@@ -738,13 +748,19 @@ def train(arm, seed, D, a, b):
     return m
 
 
-def dream_mse(m, x, z, t0, K):
+def dream_mse(m, x, z, t0, K, tf=None):
     """Squared error of a K-step dream of the predicted mean: teacher-forced up to t0, then each step's latent
     input is the previous prediction (the map and action inputs stay true, as in Mem_test's dream test).
-    x (B, T, din) inputs with x[:, t, :dz] = z_t; z (B, T, dz) targets. Predicts z_{t0+1} .. z_{t0+K}."""
+    x (B, T, din) inputs with x[:, t, :dz] = z_t; z (B, T, dz) targets. Predicts z_{t0+1} .. z_{t0+K}.
+    tf = (h, logpi, mu) of a teacher-forced pass over x that covers step t0 (lren: h[:, t] is the state after
+    input t); the dream then starts from it instead of re-running the first t0 + 1 steps."""
     dz = z.shape[2]
-    _, st, lp, mu, _ = m(x[:, :t0 + 1])
-    zh = m.mean(lp[:, -1:], mu[:, -1:])
+    if tf is None:
+        _, st, lp, mu, _ = m(x[:, :t0 + 1])
+        zh = m.mean(lp[:, -1:], mu[:, -1:])
+    else:
+        h, lp, mu = tf
+        st, zh = h[:, t0], m.mean(lp[:, t0:t0 + 1], mu[:, t0:t0 + 1])
     err = ((zh - z[:, t0 + 1:t0 + 2]) ** 2).mean()
     for j in range(1, K):
         step = torch.cat([zh, x[:, t0 + j:t0 + j + 1, dz:]], 2)
