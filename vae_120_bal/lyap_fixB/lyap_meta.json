@@ -1,0 +1,1 @@
+{"linear_map":"dct","arms":["lstm","lren@0.97g30"],"onset":{"train":171606,"val":56100,"test":85242},"sequences":{"train":39603,"val":13409,"test":18964},"steps":144}

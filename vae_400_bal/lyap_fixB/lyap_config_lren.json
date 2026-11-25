@@ -1,0 +1,12 @@
+{
+ "lren_state": 256,
+ "lren_neurons": 256,
+ "lren_head": "mix",
+ "lren_epochs": 120,
+ "lren_patience": 12,
+ "lren_mse": 10.0,
+ "lren_dream": 12,
+ "lren_dream_w": 10.0,
+ "lren_select": "dream",
+ "lren_init": "slow"
+}
